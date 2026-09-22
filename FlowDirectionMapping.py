@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import netCDF4
 import scipy
 
-figPath=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns'
+figPath='../FlowDirectionFigures'
 
 setlim=True
 latlim=[40,43]
