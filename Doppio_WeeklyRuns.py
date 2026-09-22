@@ -16,18 +16,16 @@ import xarray as xr
 from scipy import spatial
 from shapely.geometry import Point, LineString
 from shapely import line_interpolate_point
-os.chdir(r'C:\Users\annis_rgr7tey\OneDrive\Documents')
 from toolbox import haversine, bearing
-os.chdir(r'C:\Users\annis_rgr7tey')
 import matplotlib.pyplot as plt
 import pandas as pd
 from mpl_toolkits.basemap import Basemap
 from windrose import WindroseAxes
 from scipy.spatial import KDTree
 
-figPath=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns\doppio_WeeklyRun_figures'
-opDir=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns\doppio_WeeklyRun2'
-outPath=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns\doppio_WeeklyRun2'
+figPath='../doppio_WeeklyRun_figures'
+opDir='../doppio_WeeklyRun2'
+outPath='../\doppio_WeeklyRun2'
 os.makedirs(outPath,exist_ok=True)
 os.makedirs(opDir,exist_ok=True)
 os.makedirs(figPath,exist_ok=True)
