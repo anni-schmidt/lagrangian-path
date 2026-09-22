@@ -16,7 +16,6 @@ import xarray as xr
 from scipy import spatial
 from shapely.geometry import Point, LineString
 from shapely import line_interpolate_point
-os.chdir(r'C:\Users\annis_rgr7tey\OneDrive\Documents')
 from toolbox import haversine, bearing #, compass2uv
 def compass2uv(spd,drctn):
     import numpy as np
@@ -32,9 +31,9 @@ from mpl_toolkits.basemap import Basemap
 from windrose import WindroseAxes
 from scipy.spatial import KDTree
 
-figPath=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns\doppio_WeeklyRun_figures'
-opDir=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns\doppio_WeeklyRun_Customdepths_2wks_2007-2009'
-outPath=r'C:\Users\annis_rgr7tey\Documents\BIS_VS_domainRuns\doppio_WeeklyRun_Customdepths_2wks_2007-2009'
+figPath='../\doppio_WeeklyRun_figures'
+opDir='../doppio_WeeklyRun_Customdepths_2wks_2007-2009'
+outPath='../doppio_WeeklyRun_Customdepths_2wks_2007-2009'
 os.makedirs(outPath,exist_ok=True)
 os.makedirs(opDir,exist_ok=True)
 os.makedirs(figPath,exist_ok=True)
