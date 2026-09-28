@@ -6,3 +6,6 @@ Doppio_weeklyRuns_grid_multiDepth uses openDrift to calculate the trajectories o
 waypointTransit_tidal_inOrder_dijsktra uses parcels to calculate the trajectories of single particles that are following user defined waypoints. The path back to the waypoint is found using Dijkstra to choose the most efficient path. 
 
 flowDirectionMapping is the file where various plots using doppio data to analyze current patterns are created
+
+lagrangian_tracker, developed with Claude, command line run and uses the zarr directly as input
+Example usage: python lagrangian_tracker.py --source C:/Users/annis_rgr7tey/Documents/TideTest/amr3d_shakedown_z_v2.zarr --lon -70.3 --lat 41.5 --time 2026-08-18T00:00:00 --duration-hours 48.0
