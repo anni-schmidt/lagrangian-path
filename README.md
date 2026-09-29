@@ -10,3 +10,7 @@ flowDirectionMapping is the file where various plots using doppio data to analyz
 lagrangian_tracker, developed with Claude, command line run and uses the zarr directly as input
 Example usage: python lagrangian_tracker.py --source C:/Users/annis_rgr7tey/Documents/TideTest/amr3d_shakedown_z_v2.zarr --lon -70.3 --lat 41.5 --time 2026-08-18T00:00:00 --duration-hours 48.0
 Output is a csv with time, lat and lon, and a figure of the trajectory. 
+
+lagrangian_tracker_dive is an expansion of lagrangian_tracker which includes changing depth cycles
+example usage:
+python lagrangian_tracker_dive.py --source C:/Users/annis_rgr7tey/Documents/TideTest/amr3d_shakedown_z_v2.zarr --lon -70.66265 --lat 41.506975 --time 2026-08-18T00:00:00 --duration-hours 72.0 --depth-schedule 0:0 6:20 18:50 --depth-cycle-hours 24
