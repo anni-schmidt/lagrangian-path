@@ -56,6 +56,7 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
+from matplotlib.markers import MarkerStyle
 
 R_EARTH = 6371000.0  # m
 
@@ -1023,6 +1024,146 @@ def plot_trajectories(field, trajectories, out_path):
         print(f"Saved depth-vs-time plot to {depth_path}")
 
 
+def animate_trajectories(field, trajectories, out_path, fps=6, dpi=110,
+                          max_frames=300):
+    """
+    Animate the particle(s) moving along their trajectory: at each output
+    timestep, redraw the background current-vector field (nearest snapshot,
+    at the particle's current depth) and grow the trajectory line up to
+    that point, colored by depth. A particle that has already exited the
+    domain / hit the end of the record freezes at its last position
+    instead of disappearing.
+
+    Saves a GIF (via Pillow, always available with matplotlib) by default;
+    pass an --out-path ending in .mp4 to use ffmpeg instead, if installed.
+    """
+    import matplotlib.animation as animation
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+
+    all_lon = np.concatenate([t["lon"] for t in trajectories])
+    all_lat = np.concatenate([t["lat"] for t in trajectories])
+    all_depth = np.concatenate([t["depth"] for t in trajectories])
+    pad_lon = max(0.15 * np.ptp(all_lon), 0.05)
+    pad_lat = max(0.15 * np.ptp(all_lat), 0.05)
+    x0, x1 = all_lon.min() - pad_lon, all_lon.max() + pad_lon
+    y0, y1 = all_lat.min() - pad_lat, all_lat.max() + pad_lat
+    mean_lat = float(np.mean(all_lat))
+
+    in_box = (field.lon >= x0) & (field.lon <= x1) & (field.lat >= y0) & (field.lat <= y1)
+    tri_in = in_box[field.triangles].all(axis=1)
+    nodes = np.where(in_box)[0]
+    nodes = nodes[::max(1, len(nodes) // 400)]
+
+    # shared frame time axis: every distinct output time across all
+    # particles, downsampled if that would make an excessively long animation
+    frame_times = np.unique(np.concatenate([t["times"] for t in trajectories]))
+    if len(frame_times) > max_frames:
+        frame_times = frame_times[np.linspace(0, len(frame_times) - 1, max_frames).astype(int)]
+
+    depth_varies = np.ptp(all_depth) > 1e-6
+    dmin, dmax = (float(all_depth.min()), float(all_depth.max())) if depth_varies else (0.0, 1.0)
+    norm = Normalize(vmin=dmin, vmax=max(dmax, dmin + 1e-6))
+    cmap = plt.get_cmap("viridis_r")  # shallow=yellow, deep=purple
+    tab = plt.get_cmap("tab10")
+
+    def state_at(traj, frame_time):
+        """(lon, lat, depth, active) at/just before frame_time; holds the
+        last known position once the trajectory has ended."""
+        idx = int(np.searchsorted(traj["times"], frame_time, side="right")) - 1
+        active = 0 <= idx < len(traj["times"]) - 1 or (
+            idx == len(traj["times"]) - 1 and frame_time <= traj["times"][-1])
+        idx = int(np.clip(idx, 0, len(traj["times"]) - 1))
+        return traj["lon"][idx], traj["lat"][idx], traj["depth"][idx], active
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    if tri_in.any():
+        ax.triplot(field.lon, field.lat, field.triangles[tri_in],
+                  linewidth=0.2, color="0.8", zorder=1)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(mean_lat)))
+    ax.set_xlabel("longitude")
+    ax.set_ylabel("latitude")
+
+    quiv = ax.quiver(field.lon[nodes], field.lat[nodes],
+                     np.zeros(len(nodes)), np.zeros(len(nodes)),
+                     color="0.55", width=0.002, zorder=2)
+
+    lines = [LineCollection([], linewidths=2.0, cmap=cmap, norm=norm, zorder=3)
+             for _ in trajectories]
+    for lc in lines:
+        ax.add_collection(lc)
+    markers = [ax.scatter([], [], s=110, edgecolor="k", linewidths=1.2, zorder=5,
+                          color=tab(i % 10)) for i in range(len(trajectories))]
+    time_label = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", fontsize=9,
+                         bbox=dict(facecolor="white", alpha=0.8, boxstyle="round"))
+
+    if depth_varies:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, fraction=0.046)
+        cb.set_label("depth (m)")
+        cb.ax.invert_yaxis()
+
+    def update(frame_idx):
+        frame_time = frame_times[frame_idx]
+        depths_now = []
+        for i, traj in enumerate(trajectories):
+            lo, la, d, active = state_at(traj, frame_time)
+            depths_now.append(d)
+            up_to = int(np.searchsorted(traj["times"], frame_time, side="right"))
+            up_to = max(up_to, 1)
+            seg_lon, seg_lat, seg_d = traj["lon"][:up_to], traj["lat"][:up_to], traj["depth"][:up_to]
+            if up_to < len(traj["times"]) and traj["times"][up_to - 1] < frame_time:
+                pass  # already frozen at last point via state_at/up_to clamp
+            pts = np.column_stack([seg_lon, seg_lat]).reshape(-1, 1, 2)
+            segs = np.concatenate([pts[:-1], pts[1:]], axis=1) if len(pts) > 1 else []
+            lines[i].set_segments(segs)
+            lines[i].set_array(seg_d[:-1] if len(seg_d) > 1 else np.array([]))
+            marker_color = cmap(norm(d)) if depth_varies else tab(i % 10)
+            markers[i].set_offsets([[lo, la]])
+            markers[i].set_facecolor(marker_color)
+            marker_sym = "o" if active else ("x" if traj["status"] == "exited_domain" else "s")
+            markers[i].set_paths([MarkerStyle(marker_sym).get_path().transformed(
+                MarkerStyle(marker_sym).get_transform())])
+
+        # background current field: nearest snapshot to this frame, at the
+        # (mean, if several particles) depth they're currently prescribed to
+        t_sec = float((frame_time - field.times[0]) / np.timedelta64(1, "s"))
+        time_idx = int(np.clip(np.searchsorted(field.t_seconds, t_sec), 0, len(field.t_seconds) - 1))
+        mean_depth = float(np.mean(depths_now)) if depth_varies else None
+        u_snap, v_snap = field.plane_at(time_idx, depth=mean_depth)
+        quiv.set_UVC(u_snap[nodes], v_snap[nodes])
+
+        hrs = (frame_time - trajectories[0]["times"][0]) / np.timedelta64(1, "h")
+        label = f"t = {hrs:.1f} h"
+        if depth_varies:
+            label += f"   depth \u2248 {mean_depth:.0f} m"
+        time_label.set_text(label)
+        return [quiv, time_label, *lines, *markers]
+
+    ax.set_title("Offline Lagrangian particle trajectory")
+    anim = animation.FuncAnimation(fig, update, frames=len(frame_times),
+                                   interval=1000 / fps, blit=False)
+
+    if out_path.lower().endswith(".mp4"):
+        try:
+            anim.save(out_path, writer=animation.FFMpegWriter(fps=fps), dpi=dpi)
+        except (FileNotFoundError, RuntimeError) as e:
+            gif_path = out_path[:-4] + ".gif"
+            print(f"ffmpeg not available ({e}); saving as GIF instead: {gif_path}",
+                  file=sys.stderr)
+            out_path = gif_path
+            anim.save(out_path, writer=animation.PillowWriter(fps=fps), dpi=dpi)
+    else:
+        anim.save(out_path, writer=animation.PillowWriter(fps=fps), dpi=dpi)
+    plt.close(fig)
+    print(f"Saved trajectory animation to {out_path} ({len(frame_times)} frames)")
+
+
 # ---------------------------------------------------------------------------
 # 5. Main
 # ---------------------------------------------------------------------------
@@ -1073,6 +1214,15 @@ def main():
                          "levels below the bottom at each node")
     p.add_argument("--out-plot", default="trajectory.png")
     p.add_argument("--out-csv", default="trajectory.csv")
+    p.add_argument("--animate", action="store_true",
+                    help="Also save an animation of the particle(s) moving "
+                         "along their trajectory with current vectors at "
+                         "each timestep, color-coded by depth")
+    p.add_argument("--out-animation", default='TrajectoryAnimation.gif',
+                    help="Animation output path (default: --out-plot with "
+                         "_animation.gif; use a .mp4 extension for a video, "
+                         "if ffmpeg is installed)")
+    p.add_argument("--animation-fps", type=float, default=6.0)
     args = p.parse_args()
 
     n = len(args.lon)
@@ -1160,6 +1310,10 @@ def main():
             save_trajectory_csv(traj, f"{base}_{i}{ext}")
 
     plot_trajectories(field, trajectories, args.out_plot)
+
+    if args.animate:
+        anim_path = args.out_animation or args.out_plot.replace(".png", "_animation.gif")
+        animate_trajectories(field, trajectories, anim_path, fps=args.animation_fps)
 
 
 if __name__ == "__main__":
