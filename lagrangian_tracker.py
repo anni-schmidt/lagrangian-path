@@ -93,6 +93,7 @@ def validate_mesh(lon, lat, triangles):
         raise ValueError(
             f"triangles must have shape (n_triangles, 3); got {triangles.shape}. "
             f"If your connectivity variable is (3, n_elements) it needs transposing.")
+        
 
     tmin, tmax = int(triangles.min()), int(triangles.max())
     if tmin < 0 or tmax >= n_nodes:
@@ -328,9 +329,16 @@ def faces_to_triangles(conn_da, n_nodes):
     fill values (NaN, negatives, or the _FillValue attribute) used to pad
     faces with fewer than k nodes, and quads/polygons (fan-triangulated).
     """
+
     conn = np.asarray(conn_da.values, dtype=float)
+    if conn.ndim == 3:
+        conn=conn[0,:,:]
+        print('detected 3 dimensions for connectivity, used index 0 of axis 0')
+        print('Expected if model is FVCOM')
+        
     if conn.ndim != 2:
         raise ValueError(f"connectivity must be 2-D, got shape {conn.shape}")
+        raise ValueError("used first index of first dimension")
     if conn.shape[0] <= 10 and conn.shape[0] < conn.shape[1]:
         conn = conn.T  # (k, n_faces) -> (n_faces, k)
 
