@@ -366,6 +366,36 @@ class UnstructuredVelocityField:
         u = sum(bary[k] * self._profile_value(U[:, k], nodes[k], d) for k in range(3))
         v = sum(bary[k] * self._profile_value(V[:, k], nodes[k], d) for k in range(3))
         return float(u), float(v)
+    
+    def bathy_at(self, lon_pt, lat_pt):
+        """Return depth in m at a point."""
+
+        ti, bary = self._locate(lon_pt, lat_pt)
+        if ti < 0:
+            return np.nan, np.nan
+        nodes = self.triangles[ti]
+        
+        depth=np.nanmean(self.bottom_depth[nodes])
+        return depth
+        # idx1 = int(np.searchsorted(self.t_seconds, t_sec, side="right"))
+        # idx1 = min(max(idx1, 1), len(self.t_seconds) - 1)
+        # idx0 = idx1 - 1
+        # t0, t1 = self.t_seconds[idx0], self.t_seconds[idx1]
+        # w = 0.0 if t1 == t0 else (t_sec - t0) / (t1 - t0)
+
+        # if self.u.ndim == 2:
+        #     u = sum(bary[k] * ((1 - w) * self.u[idx0, nodes[k]] + w * self.u[idx1, nodes[k]])
+        #             for k in range(3))
+        #     v = sum(bary[k] * ((1 - w) * self.v[idx0, nodes[k]] + w * self.v[idx1, nodes[k]])
+        #             for k in range(3))
+        #     return float(u), float(v)
+
+        # d = self.level_depths[0] if depth is None else depth
+        # U = (1 - w) * self.u[idx0][:, nodes] + w * self.u[idx1][:, nodes]   # (n_level, 3)
+        # V = (1 - w) * self.v[idx0][:, nodes] + w * self.v[idx1][:, nodes]
+        # u = sum(bary[k] * self._profile_value(U[:, k], nodes[k], d) for k in range(3))
+        # v = sum(bary[k] * self._profile_value(V[:, k], nodes[k], d) for k in range(3))
+        # return float(u), float(v)
 
 
 def faces_to_triangles(conn_da, n_nodes):
@@ -876,6 +906,7 @@ def track_particle(field, lon0, lat0, release_time, duration_hours,
 
     d0 = depth_of(t0_sec)
     out_lon, out_lat, out_depth, out_times = [lon0], [lat0], [d0 or 0.0], [release_time]
+    bathy=[field.bathy_at(lon0,lat0)]
     lon, lat, t = lon0, lat0, t0_sec
     next_output = t0_sec + output_interval_seconds
     status = "completed"
@@ -916,12 +947,14 @@ def track_particle(field, lon0, lat0, release_time, duration_hours,
         lon += (dt / 6.0) * (dlon1 + 2 * dlon2 + 2 * dlon3 + dlon4)
         lat += (dt / 6.0) * (dlat1 + 2 * dlat2 + 2 * dlat3 + dlat4)
         t += dt
+        
 
         if t >= next_output or t >= t_end_sec:
             out_lon.append(lon)
             out_lat.append(lat)
             out_depth.append(depth_of(t - t0_sec) or 0.0)
             out_times.append(field.times[0] + np.timedelta64(int(round(t)), "s"))
+            bathy.append(field.bathy_at(lon,lat))
             next_output += output_interval_seconds
 
     if status == "completed" and truncated:
@@ -932,6 +965,7 @@ def track_particle(field, lon0, lat0, release_time, duration_hours,
         "lon": np.array(out_lon),
         "lat": np.array(out_lat),
         "depth": np.array(out_depth),
+        "bathymetry":np.array(bathy),
         "status": status,
         "exit_time": exit_time,
     }
@@ -944,9 +978,9 @@ def track_particle(field, lon0, lat0, release_time, duration_hours,
 def save_trajectory_csv(traj, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w") as f:
-        f.write("time,lon,lat,depth_m\n")
-        for t, lo, la, d in zip(traj["times"], traj["lon"], traj["lat"], traj["depth"]):
-            f.write(f"{str(t)},{lo:.6f},{la:.6f},{d:.2f}\n")
+        f.write("time,lon,lat,depth_m,bathymetry_m\n")
+        for t, lo, la, d, wd in zip(traj["times"], traj["lon"], traj["lat"], traj["depth"], traj['bathymetry']):
+            f.write(f"{str(t)},{lo:.6f},{la:.6f},{d:.2f},{wd:.2f}\n")
     print(f"Saved trajectory CSV to {path}  (status: {traj['status']})")
 
 
@@ -1025,7 +1059,8 @@ def plot_trajectories(field, trajectories, out_path):
 
 
 def animate_trajectories(field, trajectories, out_path, fps=6, dpi=110,
-                          max_frames=300):
+                          max_frames=300, quiver_scale=None,
+                          auto_quiver_scale=False):
     """
     Animate the particle(s) moving along their trajectory: at each output
     timestep, redraw the background current-vector field (nearest snapshot,
@@ -1036,6 +1071,18 @@ def animate_trajectories(field, trajectories, out_path, fps=6, dpi=110,
 
     Saves a GIF (via Pillow, always available with matplotlib) by default;
     pass an --out-path ending in .mp4 to use ffmpeg instead, if installed.
+
+    Arrow scale: by default the quiver is initialized with zero vectors
+    and matplotlib autoscales the arrow length from that (zero) data, then
+    keeps that scale fixed for every later frame -- so real vectors drawn
+    afterwards can end up too small to see, independent of whether the
+    current is actually weak there. Two ways to fix that:
+      * quiver_scale: pass a fixed matplotlib quiver `scale` value
+        yourself (smaller = longer arrows).
+      * auto_quiver_scale=True: compute a scale once from a sample of the
+        field's actual velocity data (not zeros) instead.
+    If neither is given, the old zero-based autoscale behavior is used
+    (kept as the default so existing calls/animations don't change).
     """
     import matplotlib.animation as animation
     from matplotlib.collections import LineCollection
@@ -1069,6 +1116,29 @@ def animate_trajectories(field, trajectories, out_path, fps=6, dpi=110,
     cmap = plt.get_cmap("viridis_r")  # shallow=yellow, deep=purple
     tab = plt.get_cmap("tab10")
 
+    if quiver_scale is None and auto_quiver_scale:
+        # sample actual (non-zero-initialized) velocity data across the
+        # depths/times this animation visits, and pick a scale so the
+        # median arrow has a sensible on-screen length
+        sample_depths = np.unique(all_depth) if depth_varies else [None]
+        sample_times = np.linspace(0, len(field.t_seconds) - 1,
+                                   min(6, len(field.t_seconds))).astype(int)
+        speeds = []
+        for ti in sample_times:
+            for d in sample_depths:
+                u_s, v_s = field.plane_at(int(ti), depth=d)
+                speeds.append(np.hypot(u_s[nodes], v_s[nodes]))
+        speeds = np.concatenate(speeds)
+        speeds = speeds[np.isfinite(speeds) & (speeds > 0)]
+        typical_speed = float(np.nanpercentile(speeds, 75)) if len(speeds) else 1.0
+        # matplotlib's quiver `scale` is data-units-per-arrow-length; a
+        # smaller scale draws longer arrows. Aim for a typical arrow
+        # spanning ~1/15 of the visible domain width.
+        domain_width = max(x1 - x0, 1e-6)
+        quiver_scale = typical_speed / (domain_width / 15.0)
+        print(f"Auto quiver scale: typical current speed {typical_speed:.3f} m/s "
+              f"-> scale={quiver_scale:.4g}")
+
     def state_at(traj, frame_time):
         """(lon, lat, depth, active) at/just before frame_time; holds the
         last known position once the trajectory has ended."""
@@ -1088,9 +1158,13 @@ def animate_trajectories(field, trajectories, out_path, fps=6, dpi=110,
     ax.set_xlabel("longitude")
     ax.set_ylabel("latitude")
 
+    quiv_kwargs = dict(color="0.55", width=0.002, zorder=2)
+    if quiver_scale is not None:
+        quiv_kwargs["scale"] = quiver_scale
+        quiv_kwargs["scale_units"] = "xy"
     quiv = ax.quiver(field.lon[nodes], field.lat[nodes],
                      np.zeros(len(nodes)), np.zeros(len(nodes)),
-                     color="0.55", width=0.002, zorder=2)
+                     **quiv_kwargs)
 
     lines = [LineCollection([], linewidths=2.0, cmap=cmap, norm=norm, zorder=3)
              for _ in trajectories]
@@ -1218,11 +1292,22 @@ def main():
                     help="Also save an animation of the particle(s) moving "
                          "along their trajectory with current vectors at "
                          "each timestep, color-coded by depth")
-    p.add_argument("--out-animation", default='TrajectoryAnimation.gif',
+    p.add_argument("--out-animation", default=None,
                     help="Animation output path (default: --out-plot with "
                          "_animation.gif; use a .mp4 extension for a video, "
                          "if ffmpeg is installed)")
     p.add_argument("--animation-fps", type=float, default=6.0)
+    p.add_argument("--auto-quiver-scale", action="store_true",
+                    help="Compute the animation's current-vector arrow scale "
+                         "from actual velocity data instead of matplotlib's "
+                         "default (which locks onto the initial all-zero "
+                         "frame and can make later, real arrows too small "
+                         "to see -- especially at depth, where currents are "
+                         "often weaker)")
+    p.add_argument("--quiver-scale", type=float, default=None,
+                    help="Manually fix the animation's quiver `scale` "
+                         "(data units per arrow length; smaller = longer "
+                         "arrows), overriding --auto-quiver-scale")
     args = p.parse_args()
 
     n = len(args.lon)
@@ -1313,7 +1398,9 @@ def main():
 
     if args.animate:
         anim_path = args.out_animation or args.out_plot.replace(".png", "_animation.gif")
-        animate_trajectories(field, trajectories, anim_path, fps=args.animation_fps)
+        animate_trajectories(field, trajectories, anim_path, fps=args.animation_fps,
+                             quiver_scale=args.quiver_scale,
+                             auto_quiver_scale=args.auto_quiver_scale)
 
 
 if __name__ == "__main__":
