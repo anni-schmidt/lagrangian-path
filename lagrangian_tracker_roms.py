@@ -1,0 +1,1924 @@
+"""
+Offline Lagrangian particle tracker for ocean currents on unstructured
+or structured grids
+==========================================================================
+
+Advects a particle (or several) through a pre-computed u/v current field
+defined on an unstructured triangular mesh (e.g. FVCOM, SCHISM, ADCIRC-style
+output) or a structured grid (ROMS/DOPPIO curvilinear, HYCOM-style regular
+lat/lon), starting from a user-specified release longitude/latitude/time.
+Structured grids are read and converted to a triangle mesh (each all-water
+cell becomes two triangles), so everything downstream is shared.
+"Offline" means it works entirely from saved model output -- it does not
+run or couple to the ocean model itself.
+
+Method
+------
+  * Spatial interpolation: matplotlib.tri.LinearTriInterpolator on the
+    mesh's Delaunay/model triangulation (barycentric interpolation within
+    the containing triangle, located via a TriFinder). A particle that
+    leaves the meshed domain (interpolator returns NaN) is treated as
+    exited/beached and tracking stops there.
+  * Temporal interpolation: linear blend between the two nearest saved
+    time snapshots that bracket the particle's current time.
+  * Time integration: classic 4th-order Runge-Kutta (RK4) on the
+    velocity field, with m/s converted to deg/s locally via the great
+    circle metric (R_earth, cos(latitude)).
+
+Requirements
+------------
+    pip install numpy matplotlib xarray netCDF4
+    pip install zarr fsspec                # for local/cloud Zarr stores
+    pip install s3fs                       # for s3:// Zarr stores
+    pip install gcsfs                      # for gs:// Zarr stores
+
+xarray/netCDF4 are only needed to load a real unstructured-grid NetCDF
+file; zarr/fsspec (+s3fs or gcsfs for cloud paths) are only needed if
+your source is a Zarr store rather than a .nc file. The tracker itself
+(interpolation, RK4, plotting) only needs numpy/matplotlib. Without a
+real file the script demonstrates itself on a synthetic rotating-gyre
+mesh so the whole pipeline is testable offline.
+
+Usage
+-----
+    python lagrangian_tracker.py --synthetic \
+        --lon -74.3 --lat 39.2 --time 2020-01-01T00:00:00 \
+        --duration-hours 48
+
+    python lagrangian_tracker.py --source my_fvcom_output.nc \
+        --lon -74.3 --lat 39.2 --time 2020-01-01T00:00:00 \
+        --duration-hours 72 --dt-seconds 300
+
+Structured grids (--grid-type auto|unstructured|roms|hycom; auto-detected
+by default). Only a box around the release points is read (--bbox-pad, or
+give --bbox LON_MIN LON_MAX LAT_MIN LAT_MAX), which matters for remote data:
+
+    python lagrangian_tracker.py --grid-type roms --source <DOPPIO OPeNDAP URL or .nc> \
+        --lon -73.0 --lat 39.0 --time 2020-01-01T00:00:00 --duration-hours 72
+
+    python lagrangian_tracker.py --grid-type hycom --source <HYCOM OPeNDAP URL or .nc> \
+        --lon -73.0 --lat 39.0 --time 2020-01-01T00:00:00 --depth-schedule 0:0 12:50
+
+Multiple release points: repeat --lon/--lat/--time in matching order,
+e.g. --lon -74.3 -73.9 --lat 39.2 39.0 --time 2020-01-01T00:00:00 2020-01-01T06:00:00
+"""
+
+import argparse
+import os
+import sys
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+from matplotlib.markers import MarkerStyle
+
+R_EARTH = 6371000.0  # m
+
+# names a vertical (level/layer) dimension of u/v may have
+LEVEL_DIMS = ("sigma", "siglay", "siglev", "layer", "lev", "level",
+              "depth", "nmesh2d_layer", "laydim")
+
+
+def validate_mesh(lon, lat, triangles):
+    """
+    Check a (lon, lat, triangles) mesh for the issues that commonly make
+    matplotlib.tri.Triangulation raise "Triangulation is invalid", and
+    raise a specific, actionable error instead of the generic one.
+    """
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    triangles = np.asarray(triangles)
+    n_nodes = len(lon)
+
+    if lon.shape != lat.shape:
+        raise ValueError(f"lon and lat have different shapes: {lon.shape} vs {lat.shape}")
+
+    if np.nanmax(np.abs(lat)) > 90 or np.nanmax(np.abs(lon)) > 360:
+        raise ValueError(
+            f"Node coordinates don't look like degrees (lon range "
+            f"{np.nanmin(lon):.4g}..{np.nanmax(lon):.4g}, lat range "
+            f"{np.nanmin(lat):.4g}..{np.nanmax(lat):.4g}). D-Flow FM / "
+            f"flexible-mesh output is often in projected metres -- use the "
+            f"spherical lon/lat node variables, or reproject to lon/lat first.")
+
+    bad_coords = np.where(~np.isfinite(lon) | ~np.isfinite(lat))[0]
+    if len(bad_coords):
+        raise ValueError(
+            f"{len(bad_coords)} node(s) have NaN/Inf lon or lat "
+            f"(e.g. node indices {bad_coords[:5].tolist()}) -- check for "
+            f"an unmasked fill value in the source file's coordinates.")
+
+    if triangles.ndim != 2 or triangles.shape[1] != 3:
+        raise ValueError(
+            f"triangles must have shape (n_triangles, 3); got {triangles.shape}. "
+            f"If your connectivity variable is (3, n_elements) it needs transposing.")
+
+    tmin, tmax = int(triangles.min()), int(triangles.max())
+    if tmin < 0 or tmax >= n_nodes:
+        raise ValueError(
+            f"triangle connectivity references node index {tmax} (min {tmin}), "
+            f"but only {n_nodes} nodes were loaded (valid range 0..{n_nodes - 1}). "
+            f"This almost always means the node coordinates were spatially "
+            f"subset/trimmed without renumbering the triangle connectivity to "
+            f"match -- re-load the full node set, or remap triangle indices "
+            f"after subsetting instead of subsetting lon/lat directly. It can "
+            f"also mean the connectivity array is still 1-based (FVCOM 'nv' "
+            f"convention) and the 1-based-to-0-based conversion was skipped.")
+
+    p0, p1, p2 = lon[triangles[:, 0]], lon[triangles[:, 1]], lon[triangles[:, 2]]
+    q0, q1, q2 = lat[triangles[:, 0]], lat[triangles[:, 1]], lat[triangles[:, 2]]
+    signed_area2 = (p1 - p0) * (q2 - q0) - (p2 - p0) * (q1 - q0)
+    degenerate = np.where(np.abs(signed_area2) < 1e-12)[0]
+    if len(degenerate):
+        raise ValueError(
+            f"{len(degenerate)} triangle(s) are degenerate/zero-area "
+            f"(e.g. triangle indices {degenerate[:5].tolist()}), usually from "
+            f"duplicate/coincident node coordinates. Check for repeated "
+            f"points in lon/lat, e.g. via "
+            f"np.unique(np.stack([lon, lat], axis=1), axis=0).")
+
+    dup_rows = triangles.copy()
+    dup_rows.sort(axis=1)
+    _, counts = np.unique(dup_rows, axis=0, return_counts=True)
+    if (counts > 1).any():
+        raise ValueError(
+            f"{int((counts > 1).sum())} triangle(s) appear more than once in "
+            f"the connectivity array -- check for accidental concatenation "
+            f"of connectivity from multiple grids/time steps.")
+
+    edges = np.concatenate([
+        triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]
+    ])
+    edges = np.sort(edges, axis=1)
+    _, edge_counts = np.unique(edges, axis=0, return_counts=True)
+    if (edge_counts > 2).any():
+        raise ValueError(
+            f"{int((edge_counts > 2).sum())} edge(s) are shared by more than "
+            f"2 triangles -- the mesh is non-manifold (likely duplicated or "
+            f"overlapping triangles somewhere in the connectivity array).")
+
+
+# ---------------------------------------------------------------------------
+# 1. Velocity field container (unstructured mesh + time-varying u, v)
+# ---------------------------------------------------------------------------
+
+def diagnose_mesh(lon, lat, triangles):
+    """
+    Summarize mesh sanity in one or two lines: triangle edge lengths
+    (spurious triangles bridging distant nodes show up as extreme
+    outliers) and total triangle area vs. the bounding box (a valid,
+    non-overlapping mesh can never cover more area than its bounding box).
+    Returns a human-readable string.
+    """
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    kx = np.cos(np.deg2rad(np.nanmean(lat)))
+    x, y = lon[triangles] * kx, lat[triangles]
+    e = np.stack([np.hypot(x[:, 0] - x[:, 1], y[:, 0] - y[:, 1]),
+                  np.hypot(x[:, 1] - x[:, 2], y[:, 1] - y[:, 2]),
+                  np.hypot(x[:, 2] - x[:, 0], y[:, 2] - y[:, 0])], axis=1)
+    longest = e.max(axis=1)
+    med = float(np.median(longest))
+    n_long = int((longest > 50 * med).sum())
+    area = 0.5 * np.abs((x[:, 1] - x[:, 0]) * (y[:, 2] - y[:, 0])
+                        - (x[:, 2] - x[:, 0]) * (y[:, 1] - y[:, 0]))
+    bbox = (np.ptp(lon) * kx) * np.ptp(lat)
+    ratio = float(area.sum() / bbox) if bbox > 0 else np.nan
+    msg = (f"longest triangle edge: median {med:.4f} deg, max {longest.max():.3f} deg; "
+           f"{n_long} triangle(s) have an edge >50x the median; "
+           f"total triangle area / bounding-box area = {ratio:.2f} "
+           f"(must be <= 1 for a non-overlapping mesh)")
+    if n_long:
+        msg += (". Extreme long edges usually mean triangle connectivity "
+                "does not match the node coordinates (e.g. nodes re-ordered "
+                "or subset without remapping the triangle indices)")
+    elif ratio > 1.0:
+        msg += ". Area > bounding box => triangles genuinely overlap"
+    return msg
+
+
+class KDTriangleLocator:
+    """
+    Point-in-triangle search that tolerates overlapping triangles (unlike
+    matplotlib's TrapezoidMapTriFinder, which refuses them). Candidates
+    come from the triangles touching the nearest nodes plus the triangles
+    with the nearest centroids; of those containing the point, the
+    smallest wins. Requires scipy.
+    """
+
+    def __init__(self, lon, lat, triangles):
+        from scipy.spatial import cKDTree
+        self.lon, self.lat, self.tri = lon, lat, np.asarray(triangles)
+        self.kx = float(np.cos(np.deg2rad(np.nanmean(lat))))
+        cx = lon[self.tri].mean(axis=1) * self.kx
+        cy = lat[self.tri].mean(axis=1)
+        self.ctree = cKDTree(np.column_stack([cx, cy]))
+        self.ntree = cKDTree(np.column_stack([lon * self.kx, lat]))
+        flat = self.tri.ravel()
+        order = np.argsort(flat, kind="stable")
+        self.adj = order // 3                       # node -> incident triangles (CSR)
+        self.ptr = np.concatenate([[0], np.cumsum(np.bincount(flat, minlength=len(lon)))])
+
+    def _bary(self, cands, x, y):
+        t = self.tri[cands]
+        xa, xb, xc = self.lon[t[:, 0]], self.lon[t[:, 1]], self.lon[t[:, 2]]
+        ya, yb, yc = self.lat[t[:, 0]], self.lat[t[:, 1]], self.lat[t[:, 2]]
+        det = (yb - yc) * (xa - xc) + (xc - xb) * (ya - yc)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            l1 = ((yb - yc) * (x - xc) + (xc - xb) * (y - yc)) / det
+            l2 = ((yc - ya) * (x - xc) + (xa - xc) * (y - yc)) / det
+        return np.column_stack([l1, l2, 1.0 - l1 - l2]), np.abs(det)
+
+    def find(self, x, y):
+        """Return (triangle_index, barycentric[3]) or (-1, None) if outside."""
+        p = [x * self.kx, y]
+        for n_nodes, n_cent in ((4, 24), (16, 256)):
+            _, nn = self.ntree.query(p, k=n_nodes)
+            _, cc = self.ctree.query(p, k=n_cent)
+            parts = [self.adj[self.ptr[n]:self.ptr[n + 1]] for n in np.atleast_1d(nn)
+                     if n < len(self.ptr) - 1]
+            cands = np.unique(np.concatenate(parts + [np.atleast_1d(cc)]))
+            bary, size = self._bary(cands, x, y)
+            with np.errstate(invalid="ignore"):
+                inside = np.nanmin(bary, axis=1) >= -1e-9
+            if inside.any():
+                # if several (overlapping) triangles contain the point, the
+                # smallest one is the most local / least likely to be bogus
+                pick = np.where(inside)[0][np.argmin(size[inside])]
+                return int(cands[pick]), bary[pick]
+        return -1, None
+
+
+class UnstructuredVelocityField:
+    """
+    Wraps an unstructured triangular-mesh current field and provides
+    velocity_at(lon, lat, t) with linear spatial (barycentric) and
+    linear temporal interpolation.
+
+    The containing triangle is found with matplotlib's (fast) trifinder
+    when the mesh is clean, and with a KD-tree search (KDTriangleLocator)
+    if matplotlib rejects the mesh as invalid/overlapping.
+
+    Parameters
+    ----------
+    lon, lat : (n_nodes,) node coordinates, degrees
+    triangles : (n_tri, 3) 0-based node connectivity
+    times : (n_time,) np.datetime64 array of snapshot times
+    u, v : (n_time, n_nodes) node-centered velocity components, m/s
+           (use elements_to_nodes() first if your source data is
+           element/cell-centered, as FVCOM's u/v typically are)
+    """
+
+    def __init__(self, lon, lat, triangles, times, u, v,
+                 level_depths=None, bottom_depth=None):
+        self.lon = np.asarray(lon, dtype=float)
+        self.lat = np.asarray(lat, dtype=float)
+        self.triangles = np.asarray(triangles)
+        validate_mesh(self.lon, self.lat, self.triangles)
+        self.triangulation = mtri.Triangulation(self.lon, self.lat, self.triangles)
+        self.trifinder = None
+        self.locator = None
+        try:
+            self.trifinder = self.triangulation.get_trifinder()
+        except RuntimeError as e:
+            print(f"WARNING: matplotlib rejected the mesh ({e}); some triangles "
+                  f"overlap/intersect.\n  Mesh diagnostics: "
+                  f"{diagnose_mesh(self.lon, self.lat, self.triangles)}\n"
+                  f"  Falling back to a KD-tree point locator (needs scipy). "
+                  f"Results are only trustworthy where the overlap is "
+                  f"harmless -- check the diagnostics above.", file=sys.stderr)
+            try:
+                self.locator = KDTriangleLocator(self.lon, self.lat, self.triangles)
+            except ImportError as ie:
+                raise ValueError(
+                    "The mesh has overlapping triangles and the fallback "
+                    "locator needs scipy (pip install scipy).") from ie
+        self.times = np.asarray(times, dtype="datetime64[ns]")
+        self.t_seconds = (self.times - self.times[0]) / np.timedelta64(1, "s")
+        self.u = self._as_float(u)
+        self.v = self._as_float(v)
+        self.level_depths = (None if level_depths is None
+                             else np.asarray(level_depths, dtype=float))
+        self.bottom_depth = (None if bottom_depth is None
+                             else np.asarray(bottom_depth, dtype=float))
+        if self.u.ndim == 3:
+            if self.level_depths is None or len(self.level_depths) != self.u.shape[1]:
+                raise ValueError(
+                    "3-D u/v (time, level, node) need level_depths with one "
+                    "positive-down depth (m) per level, in increasing order")
+        elif self.u.ndim != 2:
+            raise ValueError(f"u/v must be (time, node) or (time, level, node); got {self.u.shape}")
+
+    @staticmethod
+    def _as_float(a):
+        a = np.asarray(a)
+        return a if a.dtype == np.float32 else a.astype(float)
+
+    def _locate(self, x, y):
+        """Triangle index and barycentric weights for a point, or (-1, None)."""
+        if self.locator is not None:
+            return self.locator.find(x, y)
+        ti = int(self.trifinder(x, y))
+        if ti < 0:
+            return -1, None
+        t = self.triangles[ti]
+        xa, xb, xc = self.lon[t]
+        ya, yb, yc = self.lat[t]
+        det = (yb - yc) * (xa - xc) + (xc - xb) * (ya - yc)
+        l1 = ((yb - yc) * (x - xc) + (xc - xb) * (y - yc)) / det
+        l2 = ((yc - ya) * (x - xc) + (xa - xc) * (y - yc)) / det
+        return ti, np.array([l1, l2, 1.0 - l1 - l2])
+
+    def plane_at(self, time_idx, depth=0.0):
+        """Node-wise (u, v) at one snapshot and the model level nearest
+        `depth` -- used for plotting."""
+        if self.u.ndim == 3:
+            lev = int(np.argmin(np.abs(self.level_depths - (depth or 0.0))))
+            return np.nan_to_num(self.u[time_idx, lev]), np.nan_to_num(self.v[time_idx, lev])
+        return self.u[time_idx], self.v[time_idx]
+
+    def _profile_value(self, prof, node, depth):
+        """Interpolate one node's vertical profile to `depth`. Levels that
+        are NaN or below the local seabed are ignored, so a particle
+        requested deeper than the water column uses the deepest valid
+        level (i.e. it rides along just above the bottom)."""
+        ok = np.isfinite(prof)
+        if self.bottom_depth is not None:
+            ok &= self.level_depths <= self.bottom_depth[node] + 1e-6
+        if not ok.any():
+            return 0.0
+        return float(np.interp(depth, self.level_depths[ok], prof[ok]))
+
+    def velocity_at(self, lon_pt, lat_pt, t_sec, depth=None):
+        """Return (u, v) in m/s at a point/time (and depth in m, positive
+        down, if the field has levels), or (nan, nan) if the point is
+        outside the mesh or the time is outside the record."""
+        if t_sec < self.t_seconds[0] or t_sec > self.t_seconds[-1]:
+            return np.nan, np.nan
+
+        ti, bary = self._locate(lon_pt, lat_pt)
+        if ti < 0:
+            return np.nan, np.nan
+        nodes = self.triangles[ti]
+
+        idx1 = int(np.searchsorted(self.t_seconds, t_sec, side="right"))
+        idx1 = min(max(idx1, 1), len(self.t_seconds) - 1)
+        idx0 = idx1 - 1
+        t0, t1 = self.t_seconds[idx0], self.t_seconds[idx1]
+        w = 0.0 if t1 == t0 else (t_sec - t0) / (t1 - t0)
+
+        if self.u.ndim == 2:
+            u = sum(bary[k] * ((1 - w) * self.u[idx0, nodes[k]] + w * self.u[idx1, nodes[k]])
+                    for k in range(3))
+            v = sum(bary[k] * ((1 - w) * self.v[idx0, nodes[k]] + w * self.v[idx1, nodes[k]])
+                    for k in range(3))
+            return float(u), float(v)
+
+        d = self.level_depths[0] if depth is None else depth
+        U = (1 - w) * self.u[idx0][:, nodes] + w * self.u[idx1][:, nodes]   # (n_level, 3)
+        V = (1 - w) * self.v[idx0][:, nodes] + w * self.v[idx1][:, nodes]
+        u = sum(bary[k] * self._profile_value(U[:, k], nodes[k], d) for k in range(3))
+        v = sum(bary[k] * self._profile_value(V[:, k], nodes[k], d) for k in range(3))
+        return float(u), float(v)
+
+
+def faces_to_triangles(conn_da, n_nodes):
+    """
+    Convert a face->node connectivity array into an (n_tri, 3) 0-based
+    triangle array, plus `tri_face` mapping each triangle back to the
+    face/element it came from.
+
+    Handles: (3, n) FVCOM 'nv' layout or (n, k) UGRID/D-Flow FM layout,
+    1-based or 0-based indices (uses a start_index attribute if present),
+    fill values (NaN, negatives, or the _FillValue attribute) used to pad
+    faces with fewer than k nodes, and quads/polygons (fan-triangulated).
+    """
+    conn = np.asarray(conn_da.values, dtype=float)
+    if conn.ndim != 2:
+        raise ValueError(f"connectivity must be 2-D, got shape {conn.shape}")
+    if conn.shape[0] <= 10 and conn.shape[0] < conn.shape[1]:
+        conn = conn.T  # (k, n_faces) -> (n_faces, k)
+
+    fill = conn_da.attrs.get("_FillValue", None)
+    invalid = ~np.isfinite(conn) | (conn < 0)
+    if fill is not None:
+        invalid |= conn == fill
+    invalid |= conn >= 1e9  # typical unmasked fill sentinels
+
+    valid_vals = conn[~invalid]
+    start_index = conn_da.attrs.get("start_index", None)
+    if start_index is None:
+        start_index = 1 if valid_vals.size and valid_vals.min() >= 1 and \
+            valid_vals.max() == n_nodes else 0
+    conn = conn - int(start_index)
+    invalid |= conn < 0
+    conn = np.where(invalid, -1, conn).astype(np.int64)
+
+    tris, faces = [], []
+    n_valid = (conn >= 0).sum(axis=1)
+    for k in np.unique(n_valid):
+        if k < 3:
+            continue
+        idx = np.where(n_valid == k)[0]
+        rows = conn[idx][:, :k]
+        # valid nodes are assumed to be packed to the left of each row
+        for j in range(1, k - 1):
+            tris.append(np.stack([rows[:, 0], rows[:, j], rows[:, j + 1]], axis=1))
+            faces.append(idx)
+    if not tris:
+        raise ValueError("No valid faces (>=3 nodes) found in connectivity array")
+    triangles = np.concatenate(tris)
+    tri_face = np.concatenate(faces)
+    order = np.argsort(tri_face, kind="stable")
+    return triangles[order], tri_face[order]
+
+
+def repair_mesh(lon, lat, triangles):
+    """
+    Fix the mesh defects that make matplotlib's TriFinder fail with
+    "Triangulation is invalid": nodes with identical coordinates are
+    merged, and triangles that become degenerate (repeated vertex or
+    ~zero area) or duplicated are dropped.
+
+    Returns (triangles, keep_mask, info) where keep_mask indexes into the
+    *input* triangle array.
+    """
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    tri = np.asarray(triangles).copy()
+    info = {}
+
+    coords = np.round(np.stack([lon, lat], axis=1), 9)
+    _, first_idx, inverse = np.unique(coords, axis=0, return_index=True,
+                                       return_inverse=True)
+    inverse = np.asarray(inverse).reshape(-1)
+    n_merged = len(lon) - len(first_idx)
+    if n_merged:
+        tri = first_idx[inverse][tri]
+    info["merged_duplicate_nodes"] = int(n_merged)
+
+    keep = np.ones(len(tri), dtype=bool)
+    repeated = (tri[:, 0] == tri[:, 1]) | (tri[:, 1] == tri[:, 2]) | (tri[:, 0] == tri[:, 2])
+    keep &= ~repeated
+    info["repeated_vertex_triangles"] = int(repeated.sum())
+
+    x, y = lon[tri], lat[tri]
+    area2 = (x[:, 1] - x[:, 0]) * (y[:, 2] - y[:, 0]) - (x[:, 2] - x[:, 0]) * (y[:, 1] - y[:, 0])
+    zero_area = np.abs(area2) < 1e-14
+    keep &= ~zero_area
+    info["zero_area_triangles"] = int((zero_area & ~repeated).sum())
+
+    key = np.sort(tri, axis=1)
+    _, first_tri = np.unique(key, axis=0, return_index=True)
+    is_first = np.zeros(len(tri), dtype=bool)
+    is_first[first_tri] = True
+    dup = ~is_first & keep
+    keep &= ~dup
+    info["duplicate_triangles"] = int(dup.sum())
+
+    return tri[keep], keep, info
+
+
+def elements_to_nodes(values_elem, triangles, n_nodes):
+    """
+    Average element/cell-centered values onto mesh nodes (simple
+    unweighted mean of the surrounding elements). Needed because many
+    unstructured models (e.g. FVCOM) store u, v at element centers,
+    while LinearTriInterpolator needs node-centered values.
+
+    values_elem: (..., n_elements) array (any number of leading dims,
+                 e.g. time); triangles: (n_elements, 3) connectivity.
+    """
+    values_elem = np.asarray(values_elem)
+    orig_shape = values_elem.shape
+    flat = values_elem.reshape(-1, orig_shape[-1])  # (n_frames, n_elem)
+
+    node_sum = np.zeros((flat.shape[0], n_nodes))
+    node_count = np.zeros(n_nodes)
+    for corner in range(3):
+        np.add.at(node_count, triangles[:, corner], 1)
+    for f in range(flat.shape[0]):
+        vals = np.zeros(n_nodes)
+        for corner in range(3):
+            np.add.at(vals, triangles[:, corner], flat[f])
+        node_sum[f] = vals
+    node_count[node_count == 0] = 1
+    node_vals = node_sum / node_count
+    return node_vals.reshape(orig_shape[:-1] + (n_nodes,))
+
+
+# ---------------------------------------------------------------------------
+# 2. Data loading
+# ---------------------------------------------------------------------------
+
+def load_unstructured_currents(source, lon_var=None, lat_var=None,
+                                connectivity_var=None, u_var=None, v_var=None,
+                                time_var="time", layer_index=None,
+                                engine=None, consolidated=None,
+                                storage_options=None,
+                                t_start=None, t_end=None,
+                                depth_range=None, return_vertical=False,
+                                use_bottom_depth=True):
+    """
+    Load an unstructured-grid current field from a NetCDF or Zarr source
+    (FVCOM / SCHISM / similar). Variable names are auto-detected from
+    common conventions but can be overridden if your file differs.
+
+    `source` can be:
+      - a local NetCDF file path (.nc)
+      - a local Zarr store path (.zarr directory) or any path when
+        engine="zarr" is forced
+      - a cloud-hosted Zarr store URL, e.g. "s3://bucket/store.zarr" or
+        "gs://bucket/store.zarr" (requires `s3fs`/`gcsfs` installed;
+        pass credentials/options via storage_options, e.g.
+        {"anon": True} for public buckets)
+      - an http(s) URL to a Zarr store
+
+    engine : None (auto-detect from the extension/URL scheme), "zarr",
+        or "netcdf4"/"h5netcdf" to force a particular reader.
+    consolidated : passed to xr.open_zarr when engine is zarr; None lets
+        xarray auto-detect consolidated metadata.
+
+    Handles both node-centered and element-centered u/v (element-centered
+    is averaged onto nodes via elements_to_nodes()).
+
+    Vertical: if u/v carry a level dimension, then
+      * depth_range=None -> a single layer is used (layer_index, or the
+        surface layer chosen from z_levels), returning 2-D (time, node) u/v;
+      * depth_range=(dmin, dmax) -> every level from the surface down to
+        the first level at/below dmax is loaded, returning 3-D
+        (time, level, node) u/v so the tracker can interpolate in depth.
+        Set return_vertical=True to also get (level_depths, bottom_depth)
+        as two extra return values (level depths in metres, positive down,
+        increasing; bottom_depth per node or None).
+    """
+    import xarray as xr
+
+    is_zarr = (engine == "zarr") or (
+        engine is None and (
+            str(source).rstrip("/").endswith(".zarr")
+            or "://" in str(source) and str(source).rstrip("/").endswith(".zarr")
+        )
+    )
+
+    if is_zarr:
+        open_kwargs = {}
+        if consolidated is not None:
+            open_kwargs["consolidated"] = consolidated
+        if storage_options is not None:
+            open_kwargs["storage_options"] = storage_options
+        # Some Zarr stores carry stray non-array/group objects (e.g. a
+        # leftover "_temp" scratch folder from whatever wrote/synced the
+        # store). zarr-python (v3) warns about these while walking the
+        # store's hierarchy; it's harmless -- the real variables still
+        # open fine -- so it's filtered out here rather than left to
+        # clutter the console on every load.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=".*not recognized as a component of a Zarr hierarchy.*")
+            ds = xr.open_zarr(source, **open_kwargs)
+    else:
+        open_kwargs = {}
+        if engine is not None:
+            open_kwargs["engine"] = engine
+        ds = xr.open_dataset(source, **open_kwargs)
+
+    lon_var = lon_var or next((n for n in (
+        "lon", "x", "mesh2d_node_x", "node_x", "lonc") if n in ds), None)
+    lat_var = lat_var or next((n for n in (
+        "lat", "y", "mesh2d_node_y", "node_y", "latc") if n in ds), None)
+    connectivity_var = connectivity_var or next((n for n in (
+        "nv", "triangles", "tri", "element", "faces", "cells",
+        "mesh2d_face_nodes", "face_nodes", "face_node_connectivity")
+        if n in ds), None)
+    u_var = u_var or next((n for n in (
+        "u", "ua", "water_u", "mesh2d_ucx", "ucx") if n in ds), None)
+    v_var = v_var or next((n for n in (
+        "v", "va", "water_v", "mesh2d_ucy", "ucy") if n in ds), None)
+
+    if None in (lon_var, lat_var, connectivity_var, u_var, v_var):
+        raise ValueError(
+            "Could not auto-detect required variables in this file. "
+            "Pass lon_var/lat_var/connectivity_var/u_var/v_var explicitly. "
+            f"Found so far: lon={lon_var}, lat={lat_var}, "
+            f"connectivity={connectivity_var}, u={u_var}, v={v_var}. "
+            f"Variables in file: {list(ds.variables)[:40]}")
+
+    # read only the time window needed (files are often many GB)
+    all_times = ds[time_var].values
+    if t_start is not None or t_end is not None:
+        i0, i1 = 0, len(all_times) - 1
+        if t_start is not None:
+            i0 = max(int(np.searchsorted(all_times, np.datetime64(t_start), "right")) - 1, 0)
+        if t_end is not None:
+            i1 = min(int(np.searchsorted(all_times, np.datetime64(t_end), "left")),
+                     len(all_times) - 1)
+        if i1 < i0:
+            raise ValueError(
+                f"Requested window {t_start} .. {t_end} is outside the file's "
+                f"time range {all_times[0]} .. {all_times[-1]}")
+        ds = ds.isel({time_var: slice(i0, i1 + 1)})
+
+    lon = ds[lon_var].values
+    lat = ds[lat_var].values
+    n_nodes = lon.size
+
+    # connectivity -> triangles (fan-triangulates quads/polygons, drops
+    # fill values, converts 1-based to 0-based)
+    triangles, tri_face = faces_to_triangles(
+        ds[connectivity_var], n_nodes=n_nodes)
+    n_faces = int(tri_face.max()) + 1
+
+    # repair coincident nodes / degenerate / duplicate triangles
+    triangles, keep, info = repair_mesh(lon, lat, triangles)
+    tri_face = tri_face[keep]
+    if any(info.values()):
+        print(f"Mesh repair: {info}")
+
+    u_da, v_da = ds[u_var], ds[v_var]
+    level_dim = next((d for d in LEVEL_DIMS if d in u_da.dims), None)
+    level_depths = None
+    bottom_depth = None
+
+    if level_dim is not None and depth_range is not None:
+        if "z_levels" not in ds:
+            raise ValueError(
+                "A depth schedule needs the depth of each vertical level, "
+                "expected in a 'z_levels' variable, but the file has none.")
+        z = np.asarray(ds["z_levels"].values, dtype=float)
+        depth_pos = -z if z.max() <= 0 else z          # positive-down metres
+        order = np.argsort(depth_pos)
+        d_sorted = depth_pos[order]
+        hi = min(int(np.searchsorted(d_sorted, depth_range[1], side="left")),
+                 len(d_sorted) - 1)
+        sel = order[:hi + 1]
+        level_depths = d_sorted[:hi + 1]
+        print(f"Model levels ({level_dim}), depth in m: {np.round(d_sorted, 2).tolist()}")
+        print(f"Loading {len(sel)} levels ({level_depths[0]:g}-{level_depths[-1]:g} m) "
+              f"to cover the depth schedule ({depth_range[0]:g}-{depth_range[1]:g} m)")
+        u_da = u_da.isel({level_dim: sel})
+        v_da = v_da.isel({level_dim: sel})
+    elif level_dim is not None:
+        if layer_index is None:
+            # auto-pick the surface layer using z_levels if available
+            idx = 0
+            if "z_levels" in ds:
+                z = np.asarray(ds["z_levels"].values, dtype=float)
+                idx = int(np.argmax(z) if z.max() <= 0 else np.argmin(z))
+                print(f"Vertical levels ({level_dim}): {np.round(z, 2).tolist()}")
+            else:
+                print(f"No z_levels variable; using {level_dim} index 0")
+            print(f"Using {level_dim} index {idx} as the surface layer "
+                  f"(override with --layer-index)")
+        else:
+            idx = layer_index
+        u_da = u_da.isel({level_dim: idx})
+        v_da = v_da.isel({level_dim: idx})
+
+    times = ds[time_var].values
+    u = np.asarray(u_da.values)
+    v = np.asarray(v_da.values)
+    if not np.issubdtype(u.dtype, np.floating):
+        u, v = u.astype(np.float32), v.astype(np.float32)
+    if level_depths is not None:                       # -> (time, level, node)
+        dims = list(u_da.dims)
+        t_ax = dims.index(time_var) if time_var in dims else 0
+        u = np.moveaxis(u, [t_ax, dims.index(level_dim)], [0, 1])
+        v = np.moveaxis(v, [t_ax, dims.index(level_dim)], [0, 1])
+    u = np.where(np.abs(u) > 1e5, np.nan, u)  # unmasked fill values
+    v = np.where(np.abs(v) > 1e5, np.nan, v)
+
+    if u.shape[-1] == n_faces and u.shape[-1] != n_nodes:
+        # element/face-centered -> node-centered (via the triangles)
+        u = elements_to_nodes(u[..., tri_face], triangles, n_nodes)
+        v = elements_to_nodes(v[..., tri_face], triangles, n_nodes)
+    elif u.shape[-1] != n_nodes:
+        raise ValueError(
+            f"u/v last dimension ({u.shape[-1]}) matches neither the number "
+            f"of nodes ({n_nodes}) nor faces/elements ({n_faces}). If your "
+            f"variables are (node, time) instead of (time, node), transpose "
+            f"them; if they have a layer dimension not in the recognized "
+            f"list, subset it before loading.")
+
+    if "wet" in ds:
+        wet = np.asarray(ds["wet"].values) > 0
+        if u.ndim == 3 and wet.ndim == 2 and wet.shape == (u.shape[0], u.shape[2]):
+            wet = wet[:, None, :]
+        if wet.ndim == u.ndim and all(w in (1, s) for w, s in zip(wet.shape, u.shape)):
+            u = np.where(wet, u, 0.0)   # no flow at dry nodes
+            v = np.where(wet, v, 0.0)
+
+    if level_depths is None:
+        # NaNs in u/v (e.g. dry cells) would make the tracker think the
+        # particle left the domain -- treat them as zero velocity instead
+        u = np.nan_to_num(u, nan=0.0)
+        v = np.nan_to_num(v, nan=0.0)
+    elif use_bottom_depth and "depth" in ds and ds["depth"].shape == (n_nodes,):
+        bottom_depth = np.asarray(ds["depth"].values, dtype=float)
+        if np.nanmedian(bottom_depth) < 0:              # elevation convention
+            bottom_depth = -bottom_depth
+        print(f"Using 'depth' as seabed depth per node (median "
+              f"{np.nanmedian(bottom_depth):.1f} m, positive down); levels "
+              f"below the seabed are ignored (disable with --no-bottom-mask)")
+
+    if return_vertical:
+        return lon, lat, triangles, times, u, v, level_depths, bottom_depth
+    return lon, lat, triangles, times, u, v
+
+
+# ---------------------------------------------------------------------------
+# 2b. Structured-grid readers (ROMS/DOPPIO curvilinear, HYCOM-style regular)
+# ---------------------------------------------------------------------------
+#
+# Structured grids are read, subset to a bounding box / time window, and then
+# converted into the same triangle mesh the rest of the tracker already uses
+# (every all-water grid cell is split into two triangles). The depth schedule,
+# seabed handling, plotting and animation therefore work unchanged.
+
+_UNSTRUCTURED_CONN_VARS = ("nv", "triangles", "tri", "element", "faces", "cells",
+                           "mesh2d_face_nodes", "face_nodes", "face_node_connectivity")
+_LAT_NAMES = ("lat", "latitude", "nav_lat", "y")
+_LON_NAMES = ("lon", "longitude", "nav_lon", "x")
+_TIME_NAMES = ("time", "ocean_time", "valid_time", "t")
+_BASE_TARGET_DEPTHS = (0, 1, 2, 5, 10, 15, 20, 30, 40, 50, 60, 75, 100, 125, 150,
+                       200, 250, 300, 400, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000)
+
+
+def _open_dataset(source, engine=None, consolidated=None, storage_options=None):
+    """Open a NetCDF file / OPeNDAP URL / Zarr store lazily with xarray."""
+    import xarray as xr
+
+    src = str(source)
+    if engine == "zarr" or (engine is None and src.rstrip("/").endswith(".zarr")):
+        kw = {}
+        if consolidated is not None:
+            kw["consolidated"] = consolidated
+        if storage_options is not None:
+            kw["storage_options"] = storage_options
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=".*not recognized as a component of a Zarr hierarchy.*")
+            return xr.open_zarr(source, **kw)
+    kw = {"engine": engine} if engine is not None else {}
+    try:
+        xr.open_dataset(source, **kw)
+    except:
+        print('could not open source')
+    return xr.open_dataset(source, **kw)
+
+
+def _find_var(ds, names):
+    return next((n for n in names if n in ds), None)
+
+
+def _select_time_window(ds, time_var, t_start, t_end):
+    """Keep only the snapshots needed to cover [t_start, t_end] (plus one
+    either side for interpolation) so big files are not read in full."""
+    if t_start is None and t_end is None:
+        return ds
+    all_times = ds[time_var].values
+    i0, i1 = 0, len(all_times) - 1
+    if t_start is not None:
+        i0 = max(int(np.searchsorted(all_times, np.datetime64(t_start), "right")) - 1, 0)
+    if t_end is not None:
+        i1 = min(int(np.searchsorted(all_times, np.datetime64(t_end), "left")),
+                 len(all_times) - 1)
+    if i1 < i0:
+        raise ValueError(
+            f"Requested window {t_start} .. {t_end} is outside the file's "
+            f"time range {all_times[0]} .. {all_times[-1]}")
+    return ds.isel({time_var: slice(i0, i1 + 1)})
+
+
+def detect_grid_type(source=None, engine=None, storage_options=None, ds=None):
+    """Return 'unstructured', 'roms' (curvilinear lon_rho/lat_rho) or
+    'rectilinear' (1-D lat/lon, e.g. HYCOM) for a dataset."""
+    if ds is None:
+        ds = _open_dataset(source, engine=engine, storage_options=storage_options)
+    if any(n in ds for n in _UNSTRUCTURED_CONN_VARS):
+        return "unstructured"
+    if "lon_rho" in ds and "lat_rho" in ds:
+        return "roms"
+    lat = next((n for n in _LAT_NAMES if n in ds and len(ds[n].dims) == 1), None)
+    lon = next((n for n in _LON_NAMES if n in ds and len(ds[n].dims) == 1), None)
+    if lat and lon:
+        return "rectilinear"
+    raise ValueError(
+        "Could not tell what kind of grid this dataset uses (no triangle "
+        "connectivity, no lon_rho/lat_rho, no 1-D lat/lon). Pass --grid-type "
+        f"explicitly. Variables found: {list(ds.variables)[:40]}")
+
+
+def normalize_grid_type(name):
+    return {"auto": "auto", "unstructured": "unstructured", "fvcom": "unstructured",
+            "roms": "roms", "doppio": "roms",
+            "rectilinear": "rectilinear", "hycom": "rectilinear",
+            "regular": "rectilinear"}[name.lower()]
+
+
+def bbox_from_releases(lons, lats, pad_deg):
+    """(lon_min, lon_max, lat_min, lat_max) around the release points."""
+    return (min(lons) - pad_deg, max(lons) + pad_deg,
+            min(lats) - pad_deg, max(lats) + pad_deg)
+
+
+def schedule_target_depths(schedule_depths, dmax):
+    """Fixed depth levels (m, positive down) to resample terrain-following
+    data onto: a standard set up to dmax plus the exact depths in the
+    schedule, so scheduled depths are hit exactly rather than interpolated
+    between neighbouring levels."""
+    d = [x for x in _BASE_TARGET_DEPTHS if x <= dmax]
+    d += [float(x) for x in np.atleast_1d(schedule_depths) if 0 <= x <= dmax]
+    d += [0.0, float(dmax)]
+    return np.unique(np.round(np.asarray(d, dtype=float), 6))
+
+
+def grid_to_triangles(wet):
+    """Split every cell whose four corners are all water into two
+    triangles (diagonal direction alternates in a checkerboard to avoid
+    a directional bias in the linear interpolation). `wet` is a
+    (ny, nx) boolean node mask; returned indices refer to the flattened
+    (ny*nx) node numbering."""
+    ny, nx = wet.shape
+    idx = np.arange(ny * nx).reshape(ny, nx)
+    a, b, c, d = idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]
+    ok = wet[:-1, :-1] & wet[:-1, 1:] & wet[1:, 1:] & wet[1:, :-1]
+    jj, ii = np.indices(ok.shape)
+    flip = ((jj + ii) % 2 == 1)[ok]
+    A, B, C, D = a[ok], b[ok], c[ok], d[ok]
+    t1 = np.where(flip[:, None], np.stack([A, B, D], 1), np.stack([A, B, C], 1))
+    t2 = np.where(flip[:, None], np.stack([B, C, D], 1), np.stack([A, C, D], 1))
+    return np.concatenate([t1, t2])
+
+
+def _compact_grid(lon2d, lat2d, wet):
+    """Triangulate the water cells and drop nodes no triangle uses.
+    Returns lon, lat, triangles (renumbered) and `used`, the flattened
+    indices of the kept nodes (to subset other per-node arrays)."""
+    tri_full = grid_to_triangles(wet)
+    if len(tri_full) == 0:
+        raise ValueError("No all-water grid cells found in the requested "
+                         "region -- check the bounding box and the land mask")
+    used = np.unique(tri_full)
+    remap = np.full(wet.size, -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return (lon2d.ravel()[used], lat2d.ravel()[used], remap[tri_full], used)
+
+
+def _avg_pair(a, b):
+    """Mean of two arrays that falls back to the valid one at coastlines."""
+    out = 0.5 * (a + b)
+    out = np.where(np.isnan(a), b, out)
+    return np.where(np.isnan(b), a, out)
+
+
+def _stag_to_rho(arr, axis, r0, r1, s0, n_stag):
+    """Average a ROMS staggered (u- or v-point) array onto rho points.
+
+    `arr` holds staggered indices s0.. along `axis`; the result covers rho
+    indices r0..r1-1. Staggered point m sits between rho m and m+1, so rho
+    point i averages staggered points i-1 and i (just the one that exists
+    at the grid edge)."""
+    n_have = arr.shape[axis]
+    rho = np.arange(r0, r1)
+    li, ri = rho - 1, rho
+    lidx = np.clip(li - s0, 0, n_have - 1)
+    ridx = np.clip(ri - s0, 0, n_have - 1)
+    shp = [1] * arr.ndim
+    shp[axis] = -1
+    left = np.where((li >= 0).reshape(shp), np.take(arr, lidx, axis=axis), np.nan)
+    right = np.where((ri <= n_stag - 1).reshape(shp), np.take(arr, ridx, axis=axis), np.nan)
+    return _avg_pair(left, right)
+
+
+def _regrid_sigma_to_depths(arr, depth_pos, targets):
+    """Resample terrain-following data onto fixed depths, per node.
+
+    arr: (nt, ns, nn); depth_pos: (ns, nn) positive-down depth of each
+    level at each node; targets: increasing depths. Returns (nt, nz, nn)
+    float32. A target above the shallowest level takes that level's value;
+    a target deeper than a node's deepest level (i.e. below its seabed)
+    is NaN, which the tracker's depth lookup ignores (a particle there
+    rides along on the deepest valid level)."""
+    nt, ns, nn = arr.shape
+    if np.nanmean(depth_pos[0]) > np.nanmean(depth_pos[-1]):   # make shallow -> deep
+        arr, depth_pos = arr[:, ::-1], depth_pos[::-1]
+    cols = np.arange(nn)
+    out = np.empty((nt, len(targets), nn), dtype=np.float32)
+    for k, d in enumerate(targets):
+        first_deeper = (depth_pos < d).sum(axis=0)
+        lo = np.clip(first_deeper - 1, 0, ns - 1)
+        hi = np.clip(first_deeper, 0, ns - 1)
+        dl, dh = depth_pos[lo, cols], depth_pos[hi, cols]
+        span = dh - dl
+        w = np.where(span > 0, (d - dl) / np.where(span > 0, span, 1.0), 0.0)
+        w = np.clip(w, 0.0, 1.0).astype(np.float32)
+        val = arr[:, lo, cols] * (1 - w) + arr[:, hi, cols] * w
+        out[:, k] = np.where(first_deeper >= ns, np.nan, val)
+    return out
+
+
+def _bbox_index_range(lon2d, lat2d, bbox):
+    lon_min, lon_max, lat_min, lat_max = bbox
+    m = (lon2d >= lon_min) & (lon2d <= lon_max) & (lat2d >= lat_min) & (lat2d <= lat_max)
+    if not m.any():
+        raise ValueError(
+            f"No grid points inside bbox lon {lon_min:.2f}..{lon_max:.2f}, "
+            f"lat {lat_min:.2f}..{lat_max:.2f}; the grid spans lon "
+            f"{lon2d.min():.2f}..{lon2d.max():.2f}, lat {lat2d.min():.2f}..{lat2d.max():.2f}")
+    rows, cols = np.where(m.any(axis=1))[0], np.where(m.any(axis=0))[0]
+    ny, nx = lon2d.shape
+    return (max(rows.min() - 1, 0), min(rows.max() + 2, ny),
+            max(cols.min() - 1, 0), min(cols.max() + 2, nx))
+
+
+def _read_canonical(da, sel, time_var, level_dim, y_dim, x_dim):
+    """Subset a DataArray lazily, then return float32 values ordered
+    (time, [level,] y, x)."""
+    sub = da.isel(sel)
+    dims = list(sub.dims)
+    order = [dims.index(time_var)] if time_var in dims else []
+    if level_dim is not None and level_dim in dims:
+        order.append(dims.index(level_dim))
+    order += [dims.index(y_dim), dims.index(x_dim)]
+    arr = np.transpose(np.asarray(sub.values, dtype=np.float32), order)
+    return arr if time_var in dims else arr[None]
+
+
+def load_roms_currents(source, bbox=None, t_start=None, t_end=None,
+                       time_var=None, u_var=None, v_var=None,
+                       layer_index=None, depth_range=None, target_depths=None,
+                       return_vertical=False, use_bottom_depth=True, rotate=True,
+                       engine=None, consolidated=None, storage_options=None):
+    """
+    Load currents from a ROMS history/average file (e.g. DOPPIO) on its
+    curvilinear Arakawa-C grid, as a triangle mesh the tracker can use.
+
+    * u/v live on staggered u/v points; they are averaged onto rho points.
+    * ROMS u/v point along the grid axes, not east/north, so they are
+      rotated with the file's `angle` variable (rotate=True). If the file
+      has u_eastward/v_northward those are used instead (already
+      east/north). Pass rotate=False if your u/v are already east/north.
+    * Land (mask_rho) is excluded: a particle that reaches it leaves the
+      mesh and tracking stops there, as at any other mesh edge.
+    * Vertical: with depth_range=None one s-level is used (layer_index, or
+      the surface). With depth_range=(dmin, dmax) all s-levels are read and
+      resampled onto fixed depths (target_depths, default a standard set up
+      to dmax) so a depth schedule can be applied. Level depths come from
+      h, s_rho, Cs_r, hc and Vtransform with zeta = 0 (sea-surface height
+      is ignored, a small error for depths well below the surface).
+    * bbox = (lon_min, lon_max, lat_min, lat_max) limits what is read --
+      strongly recommended for remote (OPeNDAP) data.
+    """
+    ds = _open_dataset(source, engine, consolidated, storage_options)
+    time_var = time_var or _find_var(ds, _TIME_NAMES)
+    if time_var is None:
+        raise ValueError("Could not find a time variable; pass time_var")
+    ds = _select_time_window(ds, time_var, t_start, t_end)
+
+    lon2d = ((np.asarray(ds["lon_rho"].values, dtype=float) + 180.0) % 360.0) - 180.0
+    lat2d = np.asarray(ds["lat_rho"].values, dtype=float)
+    # print('lon lim is')
+    # print(str(lon2d.min()) + '  ' + str(lon2d.max()))
+    
+    # print('lat lim is')
+    # print(str(lat2d.min()) + '  ' + str(lat2d.max()))
+    
+    ny_r, nx_r = lat2d.shape
+    j0, j1, i0, i1 = (_bbox_index_range(lon2d, lat2d, bbox) if bbox
+                      else (0, ny_r, 0, nx_r))
+
+    if u_var is None and v_var is None and "u_eastward" in ds and "v_northward" in ds:
+        u_name, v_name, need_rotation = "u_eastward", "v_northward", False
+        print("Using the file's u_eastward / v_northward (already east/north).")
+    else:
+        u_name, v_name, need_rotation = u_var or "u", v_var or "v", rotate
+    for nm in (u_name, v_name):
+        if nm not in ds:
+            raise ValueError(f"Variable {nm!r} not found. Variables: {list(ds.variables)[:40]}")
+    u_da, v_da = ds[u_name], ds[v_name]
+
+    level_dim = next((d for d in LEVEL_DIMS + ("s_rho",) if d in u_da.dims), None)
+
+    def _spatial(da):
+        sp = [d for d in da.dims if d not in (time_var, level_dim)]
+        if len(sp) != 2:
+            raise ValueError(f"Expected two horizontal dimensions, got {sp}")
+        return sp
+
+    u_eta, u_xi = _spatial(u_da)
+    v_eta, v_xi = _spatial(v_da)
+    u_stag = u_da.shape[list(u_da.dims).index(u_xi)] == nx_r - 1
+    v_stag = v_da.shape[list(v_da.dims).index(v_eta)] == ny_r - 1
+    ua, ub = (max(i0 - 1, 0), min(i1, nx_r - 1)) if u_stag else (i0, i1)
+    va, vb = (max(j0 - 1, 0), min(j1, ny_r - 1)) if v_stag else (j0, j1)
+
+    sel_u = {u_eta: slice(j0, j1), u_xi: slice(ua, ub)}
+    sel_v = {v_eta: slice(va, vb), v_xi: slice(i0, i1)}
+    want_3d = level_dim is not None and depth_range is not None
+    if level_dim is not None and not want_3d:
+        ns = u_da.shape[list(u_da.dims).index(level_dim)]
+        if layer_index is None:
+            idx = int(np.argmax(ds["s_rho"].values)) if "s_rho" in ds else ns - 1
+            print(f"Using {level_dim} index {idx} as the surface layer "
+                  f"(override with --layer-index)")
+        else:
+            idx = layer_index
+        sel_u[level_dim] = idx
+        sel_v[level_dim] = idx
+        level_dim_read = None
+    else:
+        level_dim_read = level_dim
+    if depth_range is not None and level_dim is None:
+        print("WARNING: this file has no vertical dimension, so the currents do "
+              "not change with the depth schedule.", file=sys.stderr)
+
+    est_mb = 2 * 4 * np.prod([max(j1 - j0, 1), max(i1 - i0, 1)]) / 1e6 * (
+        len(ds[time_var]) * (u_da.shape[list(u_da.dims).index(level_dim)] if want_3d else 1))
+    print(f"Reading ROMS u/v for a {j1 - j0} x {i1 - i0} cell box, "
+          f"{len(ds[time_var])} snapshots (~{est_mb:.0f} MB)")
+
+    u_raw = _read_canonical(u_da, sel_u, time_var, level_dim_read, u_eta, u_xi)
+    v_raw = _read_canonical(v_da, sel_v, time_var, level_dim_read, v_eta, v_xi)
+    u_rho = _stag_to_rho(u_raw, -1, i0, i1, ua, nx_r - 1) if u_stag else u_raw
+    v_rho = _stag_to_rho(v_raw, -2, j0, j1, va, ny_r - 1) if v_stag else v_raw
+
+    if need_rotation:
+        if "angle" not in ds:
+            raise ValueError(
+                "ROMS u/v point along the model grid axes and must be rotated to "
+                "east/north, but this file has no 'angle' variable. If your u/v are "
+                "already east/north, pass rotate=False (CLI: --no-rotate).")
+        ang = np.asarray(ds["angle"].values, dtype=np.float32)[j0:j1, i0:i1]
+        c, s_ = np.cos(ang), np.sin(ang)
+        u_rho, v_rho = u_rho * c - v_rho * s_, u_rho * s_ + v_rho * c
+
+    if "mask_rho" in ds:
+        wet = np.asarray(ds["mask_rho"].values)[j0:j1, i0:i1] > 0
+    else:
+        wet = np.isfinite(u_rho).any(axis=tuple(range(u_rho.ndim - 2)))
+    u_rho = np.where(wet, u_rho, np.nan)
+    v_rho = np.where(wet, v_rho, np.nan)
+    u_rho = np.where(np.abs(u_rho) > 1e5, np.nan, u_rho)
+    v_rho = np.where(np.abs(v_rho) > 1e5, np.nan, v_rho)
+
+    lon, lat, triangles, used = _compact_grid(lon2d[j0:j1, i0:i1], lat2d[j0:j1, i0:i1], wet)
+    u = u_rho.reshape(u_rho.shape[:-2] + (-1,))[..., used]
+    v = v_rho.reshape(v_rho.shape[:-2] + (-1,))[..., used]
+
+    level_depths = bottom_depth = None
+    if want_3d:
+        missing = [n for n in ("h", "s_rho", "Cs_r", "hc") if n not in ds]
+        if missing:
+            raise ValueError(f"Need {missing} to compute the depth of the s-levels; "
+                             f"read the surface only by not using a depth schedule.")
+        h = np.asarray(ds["h"].values, dtype=float)[j0:j1, i0:i1].ravel()[used]
+        s = np.asarray(ds["s_rho"].values, dtype=float)[:, None]
+        Cs = np.asarray(ds["Cs_r"].values, dtype=float)[:, None]
+        hc = float(np.asarray(ds["hc"].values))
+        if "Vtransform" in ds:
+            vt = int(np.asarray(ds["Vtransform"].values))
+        else:
+            vt = 2
+            print("Vtransform not in file; assuming 2", file=sys.stderr)
+        if vt == 1:
+            z = hc * s + (h[None] - hc) * Cs
+        else:
+            z = h[None] * ((hc * s + h[None] * Cs) / (hc + h[None]))
+        targets = (np.asarray(target_depths, dtype=float) if target_depths is not None
+                   else schedule_target_depths([], depth_range[1]))
+        print(f"Resampling {u.shape[1]} s-levels onto {len(targets)} fixed depths "
+              f"({targets[0]:g}-{targets[-1]:g} m)")
+        u = _regrid_sigma_to_depths(u, -z, targets)
+        v = _regrid_sigma_to_depths(v, -z, targets)
+        level_depths = targets
+        bottom_depth = h if use_bottom_depth else None
+        print(f"Using h as seabed depth per node (median {np.median(h):.1f} m)")
+    else:
+        u, v = np.nan_to_num(u, nan=0.0), np.nan_to_num(v, nan=0.0)
+
+    times = ds[time_var].values
+    if return_vertical:
+        return lon, lat, triangles, times, u, v, level_depths, bottom_depth
+    return lon, lat, triangles, times, u, v
+
+
+def load_rectilinear_currents(source, bbox=None, t_start=None, t_end=None,
+                              time_var=None, lon_var=None, lat_var=None,
+                              u_var=None, v_var=None, layer_index=None,
+                              depth_range=None, return_vertical=False,
+                              engine=None, consolidated=None, storage_options=None):
+    """
+    Load currents from a regular lat/lon grid with fixed z-levels (HYCOM,
+    and similar products such as CMEMS: water_u/water_v or uo/vo).
+
+    * Longitudes in 0..360 are converted to -180..180 to match the
+      release coordinates. A bounding box that straddles the dataset's
+      longitude seam is not supported.
+    * Cells touching land / missing data are excluded, so a particle that
+      reaches the coast leaves the mesh and tracking stops there.
+    * Vertical: depth_range=None uses one level (layer_index, default the
+      shallowest). depth_range=(dmin, dmax) loads the levels from the
+      surface down to the first one at or below dmax. Levels below the
+      seabed are NaN in these products and are ignored, so a particle
+      deeper than the water column rides along on the deepest valid level.
+    """
+    ds = _open_dataset(source, engine, consolidated, storage_options)
+    time_var = time_var or _find_var(ds, _TIME_NAMES)
+    lat_var = lat_var or next((n for n in _LAT_NAMES if n in ds and len(ds[n].dims) == 1), None)
+    lon_var = lon_var or next((n for n in _LON_NAMES if n in ds and len(ds[n].dims) == 1), None)
+    u_var = u_var or _find_var(ds, ("water_u", "u", "uo", "u_velocity", "uvel", "ugos"))
+    v_var = v_var or _find_var(ds, ("water_v", "v", "vo", "v_velocity", "vvel", "vgos"))
+    if None in (time_var, lat_var, lon_var, u_var, v_var):
+        raise ValueError(
+            f"Could not find the needed variables: time={time_var}, lat={lat_var}, "
+            f"lon={lon_var}, u={u_var}, v={v_var}. Variables: {list(ds.variables)[:40]}")
+    ds = _select_time_window(ds, time_var, t_start, t_end)
+
+    lat = np.asarray(ds[lat_var].values, dtype=float)
+    lon_raw = np.asarray(ds[lon_var].values, dtype=float)
+    lat_dim, lon_dim = ds[lat_var].dims[0], ds[lon_var].dims[0]
+    if bbox is None:
+        ys, xs = slice(0, len(lat)), slice(0, len(lon_raw))
+    else:
+        lon_min, lon_max, lat_min, lat_max = bbox
+        lo, hi = ((lon_min % 360, lon_max % 360) if np.nanmax(lon_raw) > 180
+                  else (lon_min, lon_max))
+        if lo > hi:
+            raise ValueError("The bounding box straddles the dataset's longitude seam "
+                             "(0/360 or +-180), which is not supported; use a box on one side.")
+        iy = np.where((lat >= lat_min) & (lat <= lat_max))[0]
+        ix = np.where((lon_raw >= lo) & (lon_raw <= hi))[0]
+        if len(iy) == 0 or len(ix) == 0:
+            raise ValueError(
+                f"No grid points inside bbox lon {lon_min:.2f}..{lon_max:.2f}, lat "
+                f"{lat_min:.2f}..{lat_max:.2f}; the dataset spans lon "
+                f"{lon_raw.min():.2f}..{lon_raw.max():.2f}, lat {lat.min():.2f}..{lat.max():.2f}")
+        ys = slice(max(iy.min() - 1, 0), min(iy.max() + 2, len(lat)))
+        xs = slice(max(ix.min() - 1, 0), min(ix.max() + 2, len(lon_raw)))
+    lon_sel = ((lon_raw[xs] + 180.0) % 360.0) - 180.0
+    lat_sel = lat[ys]
+
+    u_da, v_da = ds[u_var], ds[v_var]
+    level_dim = next((d for d in u_da.dims if d not in (time_var, lat_dim, lon_dim)), None)
+    sel = {lat_dim: ys, lon_dim: xs}
+    level_depths = None
+    level_dim_read = None
+    if level_dim is not None:
+        if level_dim not in ds:
+            raise ValueError(f"The level dimension {level_dim!r} has no coordinate "
+                             f"variable giving the depths")
+        dvals = np.asarray(ds[level_dim].values, dtype=float)
+        depth_pos = -dvals if dvals.max() <= 0 else dvals
+        order = np.argsort(depth_pos)
+        d_sorted = depth_pos[order]
+        if depth_range is None:
+            idx = layer_index if layer_index is not None else int(order[0])
+            print(f"Using {level_dim} index {idx} ({depth_pos[idx]:g} m)")
+            sel[level_dim] = idx
+        else:
+            hi_i = min(int(np.searchsorted(d_sorted, depth_range[1], side="left")),
+                       len(d_sorted) - 1)
+            chosen = order[:hi_i + 1]
+            level_depths = d_sorted[:hi_i + 1]
+            sel[level_dim] = (slice(0, hi_i + 1) if np.array_equal(chosen, np.arange(len(chosen)))
+                              else chosen)
+            level_dim_read = level_dim
+            print(f"Loading {len(chosen)} levels ({level_depths[0]:g}-{level_depths[-1]:g} m)")
+    elif depth_range is not None:
+        print("WARNING: this dataset has no vertical dimension, so the currents do "
+              "not change with the depth schedule.", file=sys.stderr)
+
+    print(f"Reading u/v for a {len(lat_sel)} x {len(lon_sel)} point box, "
+          f"{len(ds[time_var])} snapshots")
+    u = _read_canonical(u_da, sel, time_var, level_dim_read, lat_dim, lon_dim)
+    v = _read_canonical(v_da, sel, time_var, level_dim_read, lat_dim, lon_dim)
+    u = np.where(np.abs(u) > 1e5, np.nan, u)
+    v = np.where(np.abs(v) > 1e5, np.nan, v)
+
+    top_u = u[:, 0] if u.ndim == 4 else u
+    top_v = v[:, 0] if v.ndim == 4 else v
+    wet = np.isfinite(top_u).any(axis=0) & np.isfinite(top_v).any(axis=0)
+
+    lon2d, lat2d = np.meshgrid(lon_sel, lat_sel)
+    lon, lat_n, triangles, used = _compact_grid(lon2d, lat2d, wet)
+    u = u.reshape(u.shape[:-2] + (-1,))[..., used]
+    v = v.reshape(v.shape[:-2] + (-1,))[..., used]
+    if level_depths is None:
+        u, v = np.nan_to_num(u, nan=0.0), np.nan_to_num(v, nan=0.0)
+
+    times = ds[time_var].values
+    if return_vertical:
+        return lon, lat_n, triangles, times, u, v, level_depths, None
+    return lon, lat_n, triangles, times, u, v
+
+
+def synthetic_unstructured_currents(n_points=800, n_time=25, seed=0,
+                                     lon_center=-74.0, lat_center=39.0,
+                                     domain_deg=2.0, period_hours=48,
+                                     speed_m_s=0.3, vertical=False):
+    """
+    Build a synthetic unstructured (Delaunay-triangulated) mesh covering
+    a small domain with a time-varying solid-body rotation ("gyre") plus
+    a modest steady drift, so the tracker can be exercised and sanity
+    checked (a released particle should trace out a roughly circular
+    path) without needing a real model file.
+    """
+    rng = np.random.default_rng(seed)
+    lon = lon_center + domain_deg * (rng.random(n_points) - 0.5)
+    lat = lat_center + domain_deg * (rng.random(n_points) - 0.5) * 0.8
+    triangulation = mtri.Triangulation(lon, lat)  # Delaunay via qhull
+    triangles = triangulation.triangles
+
+    start = np.datetime64("2020-01-01T00:00:00")
+    times = start + np.arange(n_time) * np.timedelta64(
+        int(period_hours * 3600 / (n_time - 1)), "s")
+
+    omega = 2 * np.pi / (period_hours * 3600.0)  # rad/s -- every radius
+    # completes one full loop in exactly period_hours (solid-body rotation)
+    dx_deg = lon - lon_center
+    dy_deg = lat - lat_center
+    # convert deg offsets to meters for a physically-scaled rotation speed
+    dx_m = dx_deg * R_EARTH * np.cos(np.deg2rad(lat_center)) * np.pi / 180
+    dy_m = dy_deg * R_EARTH * np.pi / 180
+
+    if vertical:
+        # sheared gyre: rotation weakens with depth, vanishes at 50 m and
+        # reverses below; a steady drift acts at every depth. Seabed shoals
+        # towards the south (20 m) and deepens towards the north (150 m).
+        levels = np.array([0, 5, 10, 20, 30, 50, 75, 100], dtype=float)
+        shear = 1.0 - levels / 50.0
+        u = np.zeros((n_time, len(levels), n_points))
+        v = np.zeros_like(u)
+        for k in range(n_time):
+            u[k] = shear[:, None] * (-omega * dy_m)[None, :] + 0.15 * speed_m_s
+            v[k] = shear[:, None] * (omega * dx_m)[None, :] + 0.05 * speed_m_s
+        bottom = 20.0 + 130.0 * (lat - lat.min()) / np.ptp(lat)
+        below = levels[:, None] > bottom[None, :]
+        u[:, below] = np.nan           # no data below the seabed
+        v[:, below] = np.nan
+        return lon, lat, triangles, times, u, v, levels, bottom
+
+    u = np.zeros((n_time, n_points))
+    v = np.zeros((n_time, n_points))
+    for k in range(n_time):
+        # solid-body rotation (tangential velocity = omega x r) + a small
+        # steady drift so trajectories aren't perfectly closed loops
+        u[k] = -omega * dy_m + 0.15 * speed_m_s
+        v[k] = omega * dx_m + 0.05 * speed_m_s
+
+    return lon, lat, triangles, times, u, v
+
+
+# ---------------------------------------------------------------------------
+# 3. RK4 particle tracking
+# ---------------------------------------------------------------------------
+
+class DepthSchedule:
+    """
+    A particle's depth (m, positive down) as a user-specified function of
+    elapsed time since release -- e.g. a diel vertical migration pattern,
+    or a one-off descent to a fixed depth. This *prescribes* depth; it
+    does not simulate buoyancy or vertical velocity. The horizontal
+    currents used to advect the particle are looked up at whatever depth
+    the schedule says the particle is at, at each moment.
+
+    Parameters
+    ----------
+    hours, depths : breakpoints (elapsed hours since release, depth in m,
+        positive down). Need not start at hour 0 -- depth is held constant
+        at depths[0] for any time before hours[0].
+    mode : "step" (depth jumps instantly at each breakpoint, held constant
+        in between -- the default, matching "change depth at these
+        intervals") or "linear" (ramps smoothly between breakpoints).
+    cycle_hours : if given, the schedule repeats with this period (e.g. a
+        24 h schedule for diel vertical migration repeated every day),
+        using elapsed-time modulo cycle_hours.
+    """
+
+    def __init__(self, hours, depths, mode="step", cycle_hours=None):
+        hours = np.asarray(hours, dtype=float)
+        depths = np.asarray(depths, dtype=float)
+        if len(hours) != len(depths) or len(hours) == 0:
+            raise ValueError("depth schedule needs matching, non-empty hours/depths")
+        order = np.argsort(hours)
+        self.hours, self.depths = hours[order], depths[order]
+        if mode not in ("step", "linear"):
+            raise ValueError(f"depth schedule mode must be 'step' or 'linear', got {mode!r}")
+        self.mode = mode
+        self.cycle_hours = cycle_hours
+        if cycle_hours is not None and self.hours[-1] > cycle_hours:
+            raise ValueError(
+                f"depth schedule's last breakpoint ({self.hours[-1]} h) is "
+                f"past --depth-cycle-hours ({cycle_hours} h)")
+
+    def depth_at(self, elapsed_seconds):
+        h = elapsed_seconds / 3600.0
+        if self.cycle_hours:
+            h = h % self.cycle_hours
+        if self.mode == "linear":
+            return float(np.interp(h, self.hours, self.depths))
+        idx = np.searchsorted(self.hours, h, side="right") - 1
+        idx = int(np.clip(idx, 0, len(self.hours) - 1))
+        return float(self.depths[idx])
+
+    @classmethod
+    def from_cli_tokens(cls, tokens, mode="step", cycle_hours=None):
+        """Parse ["0:0", "6:20", "12:50"] (hour:depth_m) tokens."""
+        hours, depths = [], []
+        for tok in tokens:
+            if ":" not in tok:
+                raise ValueError(
+                    f"depth schedule entry {tok!r} must be HOURS:DEPTH_M, e.g. '6:20'")
+            h_str, d_str = tok.split(":", 1)
+            try:
+                hours.append(float(h_str))
+                depths.append(float(d_str))
+            except ValueError:
+                raise ValueError(f"depth schedule entry {tok!r} is not HOURS:DEPTH_M")
+        return cls(hours, depths, mode=mode, cycle_hours=cycle_hours)
+
+
+def _deg_per_sec(u_m_s, v_m_s, lat_deg):
+    """Convert m/s velocity components to deg/s at a given latitude."""
+    dlon_dt = u_m_s / (R_EARTH * np.cos(np.deg2rad(lat_deg))) * (180.0 / np.pi)
+    dlat_dt = v_m_s / R_EARTH * (180.0 / np.pi)
+    return dlon_dt, dlat_dt
+
+
+def track_particle(field, lon0, lat0, release_time, duration_hours,
+                    dt_seconds=600, output_interval_seconds=3600,
+                    depth_fn=None):
+    """
+    Advect one particle released at (lon0, lat0, release_time) for
+    duration_hours using RK4 integration of the velocity field.
+
+    depth_fn(elapsed_seconds) -> depth_m (positive down), if given,
+    prescribes the particle's depth as a function of time since release
+    (see DepthSchedule) -- horizontal currents are then looked up at that
+    depth at every RK4 stage. None means stay at the surface/single loaded
+    layer (unchanged prior behavior).
+
+    Returns a dict with arrays 'times' (datetime64), 'lon', 'lat',
+    'depth' (m, positive down; zeros if depth_fn is None), plus 'status'
+    ('completed', 'end_of_record', or 'exited_domain') and, if exited,
+    'exit_time'.
+    """
+    release_time = np.datetime64(release_time)
+    t0_sec = float((release_time - field.times[0]) / np.timedelta64(1, "s"))
+    duration_sec = duration_hours * 3600.0
+    t_end_sec = t0_sec + duration_sec
+    record_end = float(field.t_seconds[-1])
+    truncated = t_end_sec > record_end
+    t_end_sec = min(t_end_sec, record_end)
+
+    def depth_of(elapsed_sec):
+        return depth_fn(elapsed_sec) if depth_fn is not None else None
+    
+    
+
+    d0 = depth_of(t0_sec)
+    out_lon, out_lat, out_depth, out_times = [lon0], [lat0], [d0 or 0.0], [release_time]
+    lon, lat, t = lon0, lat0, t0_sec
+    next_output = t0_sec + output_interval_seconds
+    status = "completed"
+    exit_time = None
+
+    while t < t_end_sec:
+        dt = min(dt_seconds, t_end_sec - t)
+
+        d_stage = depth_of(t - t0_sec)
+        u1, v1 = field.velocity_at(lon, lat, t, depth=d_stage)
+        # print('u comp of velocity is ')
+        # print(str(u1))
+        if np.isnan(u1):
+            status, exit_time = "exited_domain", field.times[0] + np.timedelta64(int(t), "s")
+            break
+        dlon1, dlat1 = _deg_per_sec(u1, v1, lat)
+
+        d_stage = depth_of(t + 0.5 * dt - t0_sec)
+        u2, v2 = field.velocity_at(lon + 0.5 * dt * dlon1, lat + 0.5 * dt * dlat1,
+                                    t + 0.5 * dt, depth=d_stage)
+        if np.isnan(u2):
+            status, exit_time = "exited_domain", field.times[0] + np.timedelta64(int(t + 0.5 * dt), "s")
+            break
+        dlon2, dlat2 = _deg_per_sec(u2, v2, lat + 0.5 * dt * dlat1)
+
+        u3, v3 = field.velocity_at(lon + 0.5 * dt * dlon2, lat + 0.5 * dt * dlat2,
+                                    t + 0.5 * dt, depth=d_stage)
+        if np.isnan(u3):
+            status, exit_time = "exited_domain", field.times[0] + np.timedelta64(int(t + 0.5 * dt), "s")
+            break
+        dlon3, dlat3 = _deg_per_sec(u3, v3, lat + 0.5 * dt * dlat2)
+
+        d_stage = depth_of(t + dt - t0_sec)
+        u4, v4 = field.velocity_at(lon + dt * dlon3, lat + dt * dlat3, t + dt, depth=d_stage)
+        if np.isnan(u4):
+            status, exit_time = "exited_domain", field.times[0] + np.timedelta64(int(t + dt), "s")
+            break
+        dlon4, dlat4 = _deg_per_sec(u4, v4, lat + dt * dlat3)
+
+        lon += (dt / 6.0) * (dlon1 + 2 * dlon2 + 2 * dlon3 + dlon4)
+        lat += (dt / 6.0) * (dlat1 + 2 * dlat2 + 2 * dlat3 + dlat4)
+        t += dt
+
+        if t >= next_output or t >= t_end_sec:
+            out_lon.append(lon)
+            out_lat.append(lat)
+            out_depth.append(depth_of(t - t0_sec) or 0.0)
+            out_times.append(field.times[0] + np.timedelta64(int(round(t)), "s"))
+            next_output += output_interval_seconds
+
+    if status == "completed" and truncated:
+        status = "end_of_record"
+
+    return {
+        "times": np.array(out_times, dtype="datetime64[ns]"),
+        "lon": np.array(out_lon),
+        "lat": np.array(out_lat),
+        "depth": np.array(out_depth),
+        "status": status,
+        "exit_time": exit_time,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. Output: CSV + plot
+# ---------------------------------------------------------------------------
+
+def save_trajectory_csv(traj, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write("time,lon,lat,depth_m\n")
+        for t, lo, la, d in zip(traj["times"], traj["lon"], traj["lat"], traj["depth"]):
+            f.write(f"{str(t)},{lo:.6f},{la:.6f},{d:.2f}\n")
+    print(f"Saved trajectory CSV to {path}  (status: {traj['status']})")
+
+
+def plot_trajectories(field, trajectories, out_path):
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    # only draw the part of the mesh near the trajectories (big meshes have
+    # hundreds of thousands of triangles)
+    all_lon = np.concatenate([t["lon"] for t in trajectories])
+    all_lat = np.concatenate([t["lat"] for t in trajectories])
+    pad_lon = max(0.15 * np.ptp(all_lon), 0.05)
+    pad_lat = max(0.15 * np.ptp(all_lat), 0.05)
+    x0, x1 = all_lon.min() - pad_lon, all_lon.max() + pad_lon
+    y0, y1 = all_lat.min() - pad_lat, all_lat.max() + pad_lat
+    in_box = (field.lon >= x0) & (field.lon <= x1) & (field.lat >= y0) & (field.lat <= y1)
+    tri_in = in_box[field.triangles].all(axis=1)
+    if tri_in.any():
+        ax.triplot(field.lon, field.lat, field.triangles[tri_in],
+                   linewidth=0.2, color="0.75", zorder=1)
+    nodes = np.where(in_box)[0]
+    nodes = nodes[::max(1, len(nodes) // 400)]
+    u0, v0 = field.plane_at(0, depth=trajectories[0]["depth"][0])
+    ax.quiver(field.lon[nodes], field.lat[nodes], u0[nodes], v0[nodes],
+              color="0.6", width=0.002, zorder=2,
+              label=f"velocity @ first snapshot, {trajectories[0]['depth'][0]:.0f} m")
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+
+    cmap = plt.get_cmap("tab10")
+    for i, traj in enumerate(trajectories):
+        color = cmap(i % 10)
+        ax.plot(traj["lon"], traj["lat"], "-", color=color, linewidth=1.6, zorder=3)
+        ax.scatter(traj["lon"], traj["lat"], s=10, color=color, zorder=4)
+        ax.scatter(traj["lon"][0], traj["lat"][0], marker="o", s=70,
+                   facecolor=color, edgecolor="k", zorder=5,
+                   label=f"start {i}" if len(trajectories) > 1 else "release")
+        end_label = (f"end {i} ({traj['status']})" if len(trajectories) > 1
+                     else f"end ({traj['status']})")
+        if traj["status"] == "exited_domain":
+            ax.scatter(traj["lon"][-1], traj["lat"][-1], marker="x", s=90,
+                       color=color, linewidths=2.5, zorder=5, label=end_label)
+        else:
+            ax.scatter(traj["lon"][-1], traj["lat"][-1], marker="s", s=90,
+                       facecolor=color, edgecolor="k", zorder=5, label=end_label)
+
+    mean_lat = float(np.mean(all_lat))
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(mean_lat)))
+    ax.set_xlabel("longitude")
+    ax.set_ylabel("latitude")
+    ax.set_title("Offline Lagrangian particle trajectory")
+    ax.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    print(f"Saved trajectory plot to {out_path}")
+
+    varying_depth = any(np.ptp(t["depth"]) > 1e-6 for t in trajectories)
+    if varying_depth:
+        fig2, ax2 = plt.subplots(figsize=(8, 3))
+        for i, traj in enumerate(trajectories):
+            color = cmap(i % 10)
+            hours = (traj["times"] - traj["times"][0]) / np.timedelta64(1, "h")
+            ax2.plot(hours, traj["depth"], "-o", color=color, ms=3,
+                    label=f"particle {i}" if len(trajectories) > 1 else None)
+        ax2.invert_yaxis()  # depth increases downward
+        ax2.set_xlabel("hours since release")
+        ax2.set_ylabel("depth (m)")
+        ax2.set_title("Prescribed particle depth over time")
+        ax2.grid(alpha=0.3)
+        if len(trajectories) > 1:
+            ax2.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        depth_path = out_path.replace(".png", "_depth.png")
+        plt.savefig(depth_path, dpi=150)
+        print(f"Saved depth-vs-time plot to {depth_path}")
+
+
+def animate_trajectories(field, trajectories, out_path, fps=6, dpi=110,
+                          max_frames=300, quiver_scale=None,
+                          auto_quiver_scale=False):
+    """
+    Animate the particle(s) moving along their trajectory: at each output
+    timestep, redraw the background current-vector field (nearest snapshot,
+    at the particle's current depth) and grow the trajectory line up to
+    that point, colored by depth. A particle that has already exited the
+    domain / hit the end of the record freezes at its last position
+    instead of disappearing.
+
+    Saves a GIF (via Pillow, always available with matplotlib) by default;
+    pass an --out-path ending in .mp4 to use ffmpeg instead, if installed.
+
+    Arrow scale: by default the quiver is initialized with zero vectors
+    and matplotlib autoscales the arrow length from that (zero) data, then
+    keeps that scale fixed for every later frame -- so real vectors drawn
+    afterwards can end up too small to see, independent of whether the
+    current is actually weak there. Two ways to fix that:
+      * quiver_scale: pass a fixed matplotlib quiver `scale` value
+        yourself (smaller = longer arrows).
+      * auto_quiver_scale=True: compute a scale once from a sample of the
+        field's actual velocity data (not zeros) instead.
+    If neither is given, the old zero-based autoscale behavior is used
+    (kept as the default so existing calls/animations don't change).
+    """
+    import matplotlib.animation as animation
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+
+    all_lon = np.concatenate([t["lon"] for t in trajectories])
+    all_lat = np.concatenate([t["lat"] for t in trajectories])
+    all_depth = np.concatenate([t["depth"] for t in trajectories])
+    pad_lon = max(0.15 * np.ptp(all_lon), 0.05)
+    pad_lat = max(0.15 * np.ptp(all_lat), 0.05)
+    x0, x1 = all_lon.min() - pad_lon, all_lon.max() + pad_lon
+    y0, y1 = all_lat.min() - pad_lat, all_lat.max() + pad_lat
+    mean_lat = float(np.mean(all_lat))
+
+    in_box = (field.lon >= x0) & (field.lon <= x1) & (field.lat >= y0) & (field.lat <= y1)
+    tri_in = in_box[field.triangles].all(axis=1)
+    nodes = np.where(in_box)[0]
+    nodes = nodes[::max(1, len(nodes) // 400)]
+
+    # shared frame time axis: every distinct output time across all
+    # particles, downsampled if that would make an excessively long animation
+    frame_times = np.unique(np.concatenate([t["times"] for t in trajectories]))
+    if len(frame_times) > max_frames:
+        frame_times = frame_times[np.linspace(0, len(frame_times) - 1, max_frames).astype(int)]
+
+    depth_varies = np.ptp(all_depth) > 1e-6
+    dmin, dmax = (float(all_depth.min()), float(all_depth.max())) if depth_varies else (0.0, 1.0)
+    norm = Normalize(vmin=dmin, vmax=max(dmax, dmin + 1e-6))
+    cmap = plt.get_cmap("viridis_r")  # shallow=yellow, deep=purple
+    tab = plt.get_cmap("tab10")
+
+    if quiver_scale is None and auto_quiver_scale:
+        # sample actual (non-zero-initialized) velocity data across the
+        # depths/times this animation visits, and pick a scale so the
+        # median arrow has a sensible on-screen length
+        sample_depths = np.unique(all_depth) if depth_varies else [None]
+        sample_times = np.linspace(0, len(field.t_seconds) - 1,
+                                   min(6, len(field.t_seconds))).astype(int)
+        speeds = []
+        for ti in sample_times:
+            for d in sample_depths:
+                u_s, v_s = field.plane_at(int(ti), depth=d)
+                speeds.append(np.hypot(u_s[nodes], v_s[nodes]))
+        speeds = np.concatenate(speeds)
+        speeds = speeds[np.isfinite(speeds) & (speeds > 0)]
+        typical_speed = float(np.nanpercentile(speeds, 75)) if len(speeds) else 1.0
+        # matplotlib's quiver `scale` is data-units-per-arrow-length; a
+        # smaller scale draws longer arrows. Aim for a typical arrow
+        # spanning ~1/15 of the visible domain width.
+        domain_width = max(x1 - x0, 1e-6)
+        quiver_scale = typical_speed / (domain_width / 15.0)
+        print(f"Auto quiver scale: typical current speed {typical_speed:.3f} m/s "
+              f"-> scale={quiver_scale:.4g}")
+
+    def state_at(traj, frame_time):
+        """(lon, lat, depth, active) at/just before frame_time; holds the
+        last known position once the trajectory has ended."""
+        idx = int(np.searchsorted(traj["times"], frame_time, side="right")) - 1
+        active = 0 <= idx < len(traj["times"]) - 1 or (
+            idx == len(traj["times"]) - 1 and frame_time <= traj["times"][-1])
+        idx = int(np.clip(idx, 0, len(traj["times"]) - 1))
+        return traj["lon"][idx], traj["lat"][idx], traj["depth"][idx], active
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    if tri_in.any():
+        ax.triplot(field.lon, field.lat, field.triangles[tri_in],
+                  linewidth=0.2, color="0.8", zorder=1)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(mean_lat)))
+    ax.set_xlabel("longitude")
+    ax.set_ylabel("latitude")
+
+    quiv_kwargs = dict(color="0.55", width=0.002, zorder=2)
+    if quiver_scale is not None:
+        quiv_kwargs["scale"] = quiver_scale
+        quiv_kwargs["scale_units"] = "xy"
+    quiv = ax.quiver(field.lon[nodes], field.lat[nodes],
+                     np.zeros(len(nodes)), np.zeros(len(nodes)),
+                     **quiv_kwargs)
+
+    lines = [LineCollection([], linewidths=2.0, cmap=cmap, norm=norm, zorder=3)
+             for _ in trajectories]
+    for lc in lines:
+        ax.add_collection(lc)
+    markers = [ax.scatter([], [], s=110, edgecolor="k", linewidths=1.2, zorder=5,
+                          color=tab(i % 10)) for i in range(len(trajectories))]
+    time_label = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", fontsize=9,
+                         bbox=dict(facecolor="white", alpha=0.8, boxstyle="round"))
+
+    if depth_varies:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, fraction=0.046)
+        cb.set_label("depth (m)")
+        cb.ax.invert_yaxis()
+
+    def update(frame_idx):
+        frame_time = frame_times[frame_idx]
+        depths_now = []
+        for i, traj in enumerate(trajectories):
+            lo, la, d, active = state_at(traj, frame_time)
+            depths_now.append(d)
+            up_to = int(np.searchsorted(traj["times"], frame_time, side="right"))
+            up_to = max(up_to, 1)
+            seg_lon, seg_lat, seg_d = traj["lon"][:up_to], traj["lat"][:up_to], traj["depth"][:up_to]
+            if up_to < len(traj["times"]) and traj["times"][up_to - 1] < frame_time:
+                pass  # already frozen at last point via state_at/up_to clamp
+            pts = np.column_stack([seg_lon, seg_lat]).reshape(-1, 1, 2)
+            segs = np.concatenate([pts[:-1], pts[1:]], axis=1) if len(pts) > 1 else []
+            lines[i].set_segments(segs)
+            lines[i].set_array(seg_d[:-1] if len(seg_d) > 1 else np.array([]))
+            marker_color = cmap(norm(d)) if depth_varies else tab(i % 10)
+            markers[i].set_offsets([[lo, la]])
+            markers[i].set_facecolor(marker_color)
+            marker_sym = "o" if active else ("x" if traj["status"] == "exited_domain" else "s")
+            markers[i].set_paths([MarkerStyle(marker_sym).get_path().transformed(
+                MarkerStyle(marker_sym).get_transform())])
+
+        # background current field: nearest snapshot to this frame, at the
+        # (mean, if several particles) depth they're currently prescribed to
+        t_sec = float((frame_time - field.times[0]) / np.timedelta64(1, "s"))
+        time_idx = int(np.clip(np.searchsorted(field.t_seconds, t_sec), 0, len(field.t_seconds) - 1))
+        mean_depth = float(np.mean(depths_now)) if depth_varies else None
+        u_snap, v_snap = field.plane_at(time_idx, depth=mean_depth)
+        quiv.set_UVC(u_snap[nodes], v_snap[nodes])
+
+        hrs = (frame_time - trajectories[0]["times"][0]) / np.timedelta64(1, "h")
+        label = f"t = {hrs:.1f} h"
+        if depth_varies:
+            label += f"   depth \u2248 {mean_depth:.0f} m"
+        time_label.set_text(label)
+        return [quiv, time_label, *lines, *markers]
+
+    ax.set_title("Offline Lagrangian particle trajectory")
+    anim = animation.FuncAnimation(fig, update, frames=len(frame_times),
+                                   interval=1000 / fps, blit=False)
+
+    if out_path.lower().endswith(".mp4"):
+        try:
+            anim.save(out_path, writer=animation.FFMpegWriter(fps=fps), dpi=dpi)
+        except (FileNotFoundError, RuntimeError) as e:
+            gif_path = out_path[:-4] + ".gif"
+            print(f"ffmpeg not available ({e}); saving as GIF instead: {gif_path}",
+                  file=sys.stderr)
+            out_path = gif_path
+            anim.save(out_path, writer=animation.PillowWriter(fps=fps), dpi=dpi)
+    else:
+        anim.save(out_path, writer=animation.PillowWriter(fps=fps), dpi=dpi)
+    plt.close(fig)
+    print(f"Saved trajectory animation to {out_path} ({len(frame_times)} frames)")
+
+
+# ---------------------------------------------------------------------------
+# 5. Main
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", help="NetCDF file or Zarr store (local path, "
+                    "or s3://, gs://, http(s):// URL) with unstructured-grid u/v currents")
+    p.add_argument("--engine", choices=["zarr", "netcdf4", "h5netcdf"], default=None,
+                    help="Force a reader instead of auto-detecting from --source")
+    p.add_argument("--zarr-anon", action="store_true",
+                    help="Use anonymous/unsigned access for a cloud Zarr store (public bucket)")
+    p.add_argument("--synthetic", action="store_true",
+                    help="Use a synthetic rotating-gyre mesh instead of --source")
+    p.add_argument("--grid-type", default="auto",
+                    choices=["auto", "unstructured", "roms", "doppio", "hycom",
+                             "rectilinear"],
+                    help="Kind of grid in --source: unstructured triangular mesh; "
+                         "roms/doppio (curvilinear ROMS C-grid); hycom/rectilinear "
+                         "(regular lat/lon). Default: auto-detect.")
+    p.add_argument("--bbox", type=float, nargs=4, default=None,
+                    metavar=("LON_MIN", "LON_MAX", "LAT_MIN", "LAT_MAX"),
+                    help="Structured grids: only read this box (default: the "
+                         "release points padded by --bbox-pad)")
+    p.add_argument("--bbox-pad", type=float, default=3.0,
+                    help="Degrees of padding around the release points for the "
+                         "default --bbox (make it larger for long/fast runs)")
+    p.add_argument("--no-rotate", action="store_true",
+                    help="ROMS: u/v are already east/north; skip the grid-angle rotation")
+    p.add_argument("--u-var", default=None, help="Name of the u (eastward) variable")
+    p.add_argument("--v-var", default=None, help="Name of the v (northward) variable")
+    p.add_argument("--lon", type=float, nargs="+", required=True,
+                    help="Release longitude(s), degrees")
+    p.add_argument("--lat", type=float, nargs="+", required=True,
+                    help="Release latitude(s), degrees")
+    p.add_argument("--time", type=str, nargs="+", required=True,
+                    help="Release time(s), ISO8601, e.g. 2020-01-01T00:00:00")
+    p.add_argument("--duration-hours", type=float, default=48.0)
+    p.add_argument("--dt-seconds", type=float, default=600.0,
+                    help="RK4 integration time step")
+    p.add_argument("--output-interval-hours", type=float, default=1.0,
+                    help="How often to record a trajectory point")
+    p.add_argument("--layer-index", type=int, default=None,
+                    help="Vertical layer index (default: auto-pick the surface "
+                         "layer via z_levels if present, else 0). Ignored if "
+                         "--depth-schedule is given.")
+    p.add_argument("--depth-schedule", type=str, nargs="+", default=None,
+                    help="Change the particle's depth over the run: one or "
+                         "more HOURS:DEPTH_M tokens (elapsed hours since "
+                         "release, depth in m positive-down), e.g. "
+                         "--depth-schedule 0:0 6:20 18:50. Depth is held at "
+                         "the first value before the first breakpoint and at "
+                         "the last value after the last one. Same schedule "
+                         "applies to every released particle.")
+    p.add_argument("--depth-interp", choices=["step", "linear"], default="step",
+                    help="'step' (default): depth jumps at each breakpoint and "
+                         "is held constant in between. 'linear': ramps "
+                         "smoothly between breakpoints.")
+    p.add_argument("--depth-cycle-hours", type=float, default=None,
+                    help="Repeat --depth-schedule with this period, e.g. 24 "
+                         "for a daily diel-vertical-migration pattern.")
+    p.add_argument("--no-bottom-mask", action="store_true",
+                    help="Don't use the file's seabed 'depth' variable to mask "
+                         "levels below the bottom at each node")
+    p.add_argument("--out-plot", default="trajectory.png")
+    p.add_argument("--out-csv", default="trajectory.csv")
+    p.add_argument("--animate", action="store_true",
+                    help="Also save an animation of the particle(s) moving "
+                         "along their trajectory with current vectors at "
+                         "each timestep, color-coded by depth")
+    p.add_argument("--out-animation", default=None,
+                    help="Animation output path (default: --out-plot with "
+                         "_animation.gif; use a .mp4 extension for a video, "
+                         "if ffmpeg is installed)")
+    p.add_argument("--animation-fps", type=float, default=6.0)
+    p.add_argument("--auto-quiver-scale", action="store_true",
+                    help="Compute the animation's current-vector arrow scale "
+                         "from actual velocity data instead of matplotlib's "
+                         "default (which locks onto the initial all-zero "
+                         "frame and can make later, real arrows too small "
+                         "to see -- especially at depth, where currents are "
+                         "often weaker)")
+    p.add_argument("--quiver-scale", type=float, default=None,
+                    help="Manually fix the animation's quiver `scale` "
+                         "(data units per arrow length; smaller = longer "
+                         "arrows), overriding --auto-quiver-scale")
+    args = p.parse_args()
+
+    n = len(args.lon)
+    if not (len(args.lat) == n and len(args.time) == n):
+        p.error("--lon, --lat, and --time must all have the same number of values")
+
+    depth_schedule = None
+    level_depths = bottom_depth = None
+    if args.depth_schedule is not None:
+        depth_schedule = DepthSchedule.from_cli_tokens(
+            args.depth_schedule, mode=args.depth_interp,
+            cycle_hours=args.depth_cycle_hours)
+        max_depth = float(depth_schedule.depths.max())
+        print(f"Depth schedule ({args.depth_interp}): "
+              f"{list(zip(depth_schedule.hours.tolist(), depth_schedule.depths.tolist()))} "
+              f"h:m" + (f", repeating every {args.depth_cycle_hours} h" if args.depth_cycle_hours else ""))
+
+    if args.synthetic or not args.source:
+        if not args.synthetic:
+            print("No --source given; using synthetic demo current field.", file=sys.stderr)
+        if depth_schedule is not None:
+            lon, lat, triangles, times, u, v, level_depths, bottom_depth = \
+                synthetic_unstructured_currents(vertical=True)
+        else:
+            lon, lat, triangles, times, u, v = synthetic_unstructured_currents()
+    else:
+        try:
+            print(f"Loading currents from {args.source} ...")
+            storage_options = {"anon": True} if args.zarr_anon else None
+            rel = [np.datetime64(t) for t in args.time]
+            win_start = min(rel)
+            win_end = max(rel) + np.timedelta64(int(args.duration_hours * 3600), "s")
+            grid_type = normalize_grid_type(args.grid_type)
+            if grid_type == "auto":
+                grid_type = detect_grid_type(args.source, engine=args.engine,
+                                             storage_options=storage_options)
+                print(f"Detected grid type: {grid_type}")
+            if grid_type == "unstructured":
+                if depth_schedule is not None:
+                    lon, lat, triangles, times, u, v, level_depths, bottom_depth = \
+                        load_unstructured_currents(
+                            args.source, u_var=args.u_var, v_var=args.v_var,
+                            engine=args.engine, storage_options=storage_options,
+                            t_start=win_start, t_end=win_end,
+                            depth_range=(0.0, max_depth), return_vertical=True,
+                            use_bottom_depth=not args.no_bottom_mask)
+                else:
+                    lon, lat, triangles, times, u, v = load_unstructured_currents(
+                        args.source, u_var=args.u_var, v_var=args.v_var,
+                        layer_index=args.layer_index, engine=args.engine,
+                        storage_options=storage_options, t_start=win_start, t_end=win_end)
+            else:
+                bbox = tuple(args.bbox) if args.bbox else bbox_from_releases(
+                    args.lon, args.lat, args.bbox_pad)
+                print(f"Reading box lon {bbox[0]:.2f}..{bbox[1]:.2f}, "
+                      f"lat {bbox[2]:.2f}..{bbox[3]:.2f}")
+                common = dict(bbox=bbox, t_start=win_start, t_end=win_end,
+                              u_var=args.u_var, v_var=args.v_var,
+                              layer_index=args.layer_index,
+                              depth_range=(0.0, max_depth) if depth_schedule is not None else None,
+                              return_vertical=True, engine=args.engine,
+                              storage_options=storage_options)
+                if grid_type == "roms":
+                    targets = (schedule_target_depths(depth_schedule.depths, max_depth)
+                               if depth_schedule is not None else None)
+                    lon, lat, triangles, times, u, v, level_depths, bottom_depth = \
+                        load_roms_currents(args.source, target_depths=targets,
+                                           use_bottom_depth=not args.no_bottom_mask,
+                                           rotate=not args.no_rotate, **common)
+                else:
+                    lon, lat, triangles, times, u, v, level_depths, bottom_depth = \
+                        load_rectilinear_currents(args.source, **common)
+        except Exception as e:
+            print(f"Could not load {args.source} ({e}).\n"
+                  f"Falling back to synthetic demo data so you can still "
+                  f"test the tracker.", file=sys.stderr)
+            if depth_schedule is not None:
+                lon, lat, triangles, times, u, v, level_depths, bottom_depth = \
+                    synthetic_unstructured_currents(vertical=True)
+            else:
+                lon, lat, triangles, times, u, v = synthetic_unstructured_currents()
+
+    print(f"Mesh: {len(lon)} nodes, {len(triangles)} triangles, "
+          f"{len(times)} time snapshots ({times[0]} to {times[-1]})")
+
+    field = UnstructuredVelocityField(lon, lat, triangles, times, u, v,
+                                      level_depths=level_depths, bottom_depth=bottom_depth)
+
+    trajectories = []
+    for lon0, lat0, t0 in zip(args.lon, args.lat, args.time):
+        print(f"Tracking particle released at ({lon0}, {lat0}) at {t0} "
+              f"for {args.duration_hours} h ...")
+        depth_fn = depth_schedule.depth_at if depth_schedule is not None else None
+        traj = track_particle(field, lon0, lat0, t0, args.duration_hours,
+                               dt_seconds=args.dt_seconds,
+                               output_interval_seconds=args.output_interval_hours * 3600,
+                               depth_fn=depth_fn)
+        if traj["status"] == "exited_domain":
+            print(f"  -> exited the meshed domain at {traj['exit_time']}")
+        elif traj["status"] == "end_of_record":
+            print(f"  -> reached the end of the velocity record "
+                  f"({field.times[-1]}) before {args.duration_hours} h elapsed; "
+                  f"final position ({traj['lon'][-1]:.4f}, {traj['lat'][-1]:.4f})")
+        else:
+            print(f"  -> completed: final position ({traj['lon'][-1]:.4f}, "
+                  f"{traj['lat'][-1]:.4f})")
+        trajectories.append(traj)
+
+    if n == 1:
+        save_trajectory_csv(trajectories[0], args.out_csv)
+    else:
+        for i, traj in enumerate(trajectories):
+            base, ext = os.path.splitext(args.out_csv)
+            save_trajectory_csv(traj, f"{base}_{i}{ext}")
+
+    plot_trajectories(field, trajectories, args.out_plot)
+
+    if args.animate:
+        anim_path = args.out_animation or args.out_plot.replace(".png", "_animation.gif")
+        animate_trajectories(field, trajectories, anim_path, fps=args.animation_fps,
+                             quiver_scale=args.quiver_scale,
+                             auto_quiver_scale=args.auto_quiver_scale)
+
+
+if __name__ == "__main__":
+    main()
