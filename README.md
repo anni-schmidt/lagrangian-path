@@ -18,6 +18,8 @@ python lagrangian_tracker_dive.py --source C:/Users/annis_rgr7tey/Documents/Tide
 
 flow_plots and lyapunov use various ways of plotting flow patterns. Lyapunov uses the finite time lyapunov exponent, plots the map and highlights the attracting/repelling ridges. Flow_plots plots flow trajectories and streamlines in the area for the time specified. (known bugs, cannot edit number of points)
 
+For more information on LCS and FTLE see https://shaddenlab.berkeley.edu/uploads/LCS-tutorial/overview.html
+
 Example usage:
 python flow_plots.py --source https://tds.marine.rutgers.edu/thredds/dodsC/roms/doppio/bgc_oa/013/avg_1d --bbox -74 -67 40 43 --time 2008-01-01T00:00 --duration-hours 72 --animate 
 
