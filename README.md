@@ -21,4 +21,4 @@ flow_plots and lyapunov use various ways of plotting flow patterns. Lyapunov use
 Example usage:
 python flow_plots.py --source https://tds.marine.rutgers.edu/thredds/dodsC/roms/doppio/bgc_oa/013/avg_1d --bbox -74 -67 40 43 --time 2008-01-01T00:00 --duration-hours 72 --animate 
 
-python lyapunox.py --source https://tds.marine.rutgers.edu/thredds/dodsC/roms/doppio/bgc_oa/013/avg_1d --bbox -74 -67 40 43 --time 2008-01-01T00:00 --integration-hours 72 [--depth 10] [--grid-type roms|hycom]
+python lyapunov.py --source https://tds.marine.rutgers.edu/thredds/dodsC/roms/doppio/bgc_oa/013/avg_1d --bbox -74 -67 40 43 --time 2008-01-01T00:00 --integration-hours 72 [--depth 10] [--grid-type roms|hycom]
