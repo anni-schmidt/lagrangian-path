@@ -14,3 +14,11 @@ Output is a csv with time, lat and lon, and a figure of the trajectory.
 lagrangian_tracker_dive is an expansion of lagrangian_tracker which includes changing depth cycles
 example usage:
 python lagrangian_tracker_dive.py --source C:/Users/annis_rgr7tey/Documents/TideTest/amr3d_shakedown_z_v2.zarr --lon -70.66265 --lat 41.506975 --time 2026-08-18T00:00:00 --duration-hours 72.0 --depth-schedule 0:0 6:20 18:50 --depth-cycle-hours 24
+
+
+flow_plots and lyapunov use various ways of plotting flow patterns. Lyapunov uses the finite time lyapunov exponent, plots the map and highlights the attracting/repelling ridges. Flow_plots plots flow trajectories and streamlines in the area for the time specified. (known bugs, cannot edit number of points)
+
+Example usage:
+python flow_plots.py --source https://tds.marine.rutgers.edu/thredds/dodsC/roms/doppio/bgc_oa/013/avg_1d --bbox -74 -67 40 43 --time 2008-01-01T00:00 --duration-hours 72 --animate 
+
+python lyapunox.py --source https://tds.marine.rutgers.edu/thredds/dodsC/roms/doppio/bgc_oa/013/avg_1d --bbox -74 -67 40 43 --time 2008-01-01T00:00 --integration-hours 72 [--depth 10] [--grid-type roms|hycom]
