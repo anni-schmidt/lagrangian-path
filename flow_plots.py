@@ -24,6 +24,8 @@ readers, including a chosen depth):
 Usage
 -----
     python flow_plots.py --synthetic            # time-dependent double gyre demo
+    python flow_plots.py --synthetic --depths 0 50 100   # same at three depths (adds
+                                                # *_depths_streamlines.png and *_depths_mean_tracks.png)
 
     python flow_plots.py --source fvcom_out.nc --bbox -71.0 -69.5 41.5 42.5 \\
         --time 2026-08-19T00:00 --duration-hours 72
@@ -49,6 +51,7 @@ import lyapunov as ly
 
 R_EARTH = lt.R_EARTH
 DEG = np.pi / 180.0
+DPI = 140            # resolution of the saved figures (set by --dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +151,7 @@ def plot_streamlines_in_time(field, bbox, times, out_path, n_points=100, depth=N
     fig.suptitle("Instantaneous streamlines" + (f" at {depth:g} m depth" if depth is not None else ""),
                  fontsize=12)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    fig.savefig(out_path, dpi=140)
+    fig.savefig(out_path, dpi=DPI)
     plt.close(fig)
     print(f"Saved streamline panels to {out_path}")
 
@@ -194,6 +197,55 @@ def animate_streamlines(field, bbox, times, out_path, n_points=90, depth=None,
 # ---------------------------------------------------------------------------
 # 2. average particle tracks
 # ---------------------------------------------------------------------------
+
+def _label(d):
+    return "surface" if d is None else f"{d:g} m"
+
+
+def plot_streamlines_by_depth(field, bbox, when, depths, out_path, n_points=100, density=1.6,
+                              shared_scale=True, ncols=3):
+    """Streamlines at one moment for several depths, side by side.
+    shared_scale=True colours every panel on one speed scale (so how much
+    the flow weakens with depth is visible); False scales each panel alone
+    (to see the pattern at depth clearly)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+
+    _check_record(field, when, when)
+    lon_g, lat_g = _regular_grid(bbox, n_points)
+    snaps = [sample_on_grid(field, lon_g, lat_g, when, d) for d in depths]
+    norms = [_speed_norm([np.hypot(u, v) for u, v in snaps])] * len(depths) if shared_scale else \
+        [_speed_norm([np.hypot(u, v)]) for u, v in snaps]
+    n = len(depths)
+    ncols = min(ncols, n)
+    nrows = int(np.ceil(n / ncols))
+    mean_lat = 0.5 * (bbox[2] + bbox[3])
+    aspect = (bbox[3] - bbox[2]) / ((bbox[1] - bbox[0]) * np.cos(np.deg2rad(mean_lat)))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6 * ncols + 1.2, nrows * (5.6 * aspect + 1.0) + 0.6),
+                             squeeze=False, constrained_layout=True)
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
+    for ax, d, (u, v), norm in zip(axes.ravel(), depths, snaps, norms):
+        ax.set_facecolor("0.86")
+        _draw_streamlines(ax, lon_g, lat_g, u, v, norm, density)
+        ax.set_title(_label(d), fontsize=10)
+        ax.set_xlim(bbox[0], bbox[1])
+        ax.set_ylim(bbox[2], bbox[3])
+        ax.set_aspect(1.0 / np.cos(np.deg2rad(mean_lat)))
+        ax.set_xlabel("longitude")
+        ax.set_ylabel("latitude")
+        if not shared_scale:
+            fig.colorbar(ScalarMappable(norm=norm, cmap="viridis"), ax=ax, shrink=0.8, label="speed (m/s)")
+    if shared_scale:
+        fig.colorbar(ScalarMappable(norm=norms[0], cmap="viridis"), ax=axes.ravel().tolist(),
+                     shrink=0.8, label="speed (m/s)")
+    fig.suptitle(f"Streamlines by depth at {str(np.datetime64(when))[:16]}"
+                 + (" (one speed scale)" if shared_scale else " (each panel on its own scale)"), fontsize=12)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=DPI)
+    plt.close(fig)
+    print(f"Saved streamlines-by-depth to {out_path}")
+
 
 def compute_mean_tracks(field, bbox, t_ref, hours, direction="forward", n_x=6, n_y=None,
                         cluster_size=3, spacing_km=None, dt_seconds=1800.0, depth=None):
@@ -317,9 +369,111 @@ def plot_mean_tracks(tracks, field, bbox, out_path, n_points=90, n_bg_times=6):
         fig.colorbar(lc, cax=cax, label="hours since release" if sign > 0
                      else "hours before t_ref (backward)")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved mean-track plot to {out_path}")
+
+
+def _add_tracks(ax, tracks, norm):
+    """Draw cluster-mean tracks coloured by elapsed time; returns the LineCollection."""
+    import matplotlib.patheffects as pe
+    from matplotlib.collections import LineCollection
+    segs, vals = [], []
+    for i in range(tracks["mean_lon"].shape[1]):
+        lo, la = tracks["mean_lon"][:, i], tracks["mean_lat"][:, i]
+        n_ok = int((np.isfinite(lo) & np.isfinite(la)).sum())
+        if n_ok < 2:
+            continue
+        pts = np.column_stack([lo[:n_ok], la[:n_ok]])
+        segs.append(np.stack([pts[:-1], pts[1:]], axis=1))
+        vals.append(0.5 * (tracks["elapsed_h"][:n_ok - 1] + tracks["elapsed_h"][1:n_ok]))
+        ax.annotate("", xy=pts[-1], xytext=pts[-2], zorder=6,
+                    arrowprops=dict(arrowstyle="-|>", color="k", lw=0.8, mutation_scale=8,
+                                    path_effects=[pe.withStroke(linewidth=2.0, foreground="white")]))
+    if not segs:
+        return None
+    lc = LineCollection(np.concatenate(segs), cmap="plasma", norm=norm, linewidths=1.8,
+                        path_effects=[pe.withStroke(linewidth=3.2, foreground="white")], zorder=4)
+    lc.set_array(np.concatenate(vals))
+    ax.add_collection(lc)
+    return lc
+
+
+def plot_mean_tracks_by_depth(tracks_by_depth, field, bbox, out_path, n_points=80, n_bg_times=5):
+    """
+    Mean tracks at several depths: one map per depth (same release points,
+    same colour scale for elapsed time, each over its own time-mean speed),
+    then the cluster spread against time for every depth, so differences in
+    both the paths and how fast clusters disperse can be compared.
+    tracks_by_depth: list of (depth, tracks) from compute_mean_tracks.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    n = len(tracks_by_depth)
+    first = tracks_by_depth[0][1]
+    sign = 1.0 if first["direction"] == "forward" else -1.0
+    show_spread = first["cluster_size"] > 1
+    lon_g, lat_g = _regular_grid(bbox, n_points)
+    span = np.timedelta64(int(first["hours"] * 3600), "s")
+    bgs = []
+    for d, tr in tracks_by_depth:
+        moments = [tr["t_ref"] + sign * span * f for f in np.linspace(0, 1, n_bg_times)]
+        sp = [np.hypot(*sample_on_grid(field, lon_g, lat_g, t, d)) for t in moments]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            bgs.append(np.nanmean(np.stack(sp), axis=0))
+    vmax = 1.6 * float(np.nanpercentile(np.concatenate([b[np.isfinite(b)] for b in bgs]), 99))
+    mean_lat = 0.5 * (bbox[2] + bbox[3])
+    aspect = (bbox[3] - bbox[2]) / ((bbox[1] - bbox[0]) * np.cos(np.deg2rad(mean_lat)))
+    ncols = n + (1 if show_spread else 0)
+    fig, axes = plt.subplots(1, ncols, squeeze=False, constrained_layout=True,
+                             figsize=(4.9 * n + (4.4 if show_spread else 0) + 1.2, 4.9 * aspect + 1.9))
+    norm = Normalize(0, first["hours"])
+    lc = None
+    for j, ((d, tr), bg) in enumerate(zip(tracks_by_depth, bgs)):
+        ax = axes[0, j]
+        ax.set_facecolor("0.86")
+        ax.pcolormesh(lon_g, lat_g, bg, cmap="Greys", vmin=0, vmax=vmax, shading="auto", alpha=0.65)
+        got = _add_tracks(ax, tr, norm)
+        lc = got if got is not None else lc
+        ax.scatter(tr["start_lon"], tr["start_lat"], s=20, facecolor="white", edgecolor="k",
+                   linewidths=0.8, zorder=7)
+        if show_spread:
+            ax.scatter(tr["end_lon"], tr["end_lat"], s=4, color="0.25", alpha=0.5, linewidths=0, zorder=5)
+        ax.set_xlim(bbox[0], bbox[1])
+        ax.set_ylim(bbox[2], bbox[3])
+        ax.set_aspect(1.0 / np.cos(np.deg2rad(mean_lat)))
+        ax.set_title(_label(d), fontsize=10)
+        ax.set_xlabel("longitude")
+        if j == 0:
+            ax.set_ylabel("latitude")
+    if lc is not None:
+        fig.colorbar(lc, ax=axes[0, :n].tolist(), shrink=0.8, pad=0.01,
+                     label="hours since release" if sign > 0 else "hours before t_ref (backward)")
+    if show_spread:
+        ax2 = axes[0, n]
+        cmap = plt.get_cmap("viridis")
+        for k, (d, tr) in enumerate(tracks_by_depth):
+            col = cmap(k / max(n - 1, 1) * 0.9)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                med = np.nanmedian(tr["spread_km"], axis=1)
+                q1, q3 = np.nanpercentile(tr["spread_km"], [25, 75], axis=1)
+            ax2.plot(tr["elapsed_h"], med, color=col, lw=2.2, label=_label(d))
+            ax2.fill_between(tr["elapsed_h"], q1, q3, color=col, alpha=0.15, linewidth=0)
+        ax2.set_yscale("log")
+        ax2.set_xlabel("hours since release" if sign > 0 else "hours before t_ref")
+        ax2.set_ylabel("cluster spread (km): median, IQR band")
+        ax2.set_title("Dispersion by depth", fontsize=10)
+        ax2.grid(alpha=0.3)
+        ax2.legend(fontsize=8, title="depth")
+    fig.suptitle(f"{first['direction']} mean tracks by depth: {first['hours']:g} h from "
+                 f"{str(first['t_ref'])[:16]}  (grey: time-mean speed at that depth)", fontsize=11)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=DPI)
+    plt.close(fig)
+    print(f"Saved mean-tracks-by-depth to {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +500,9 @@ def main():
                    help="Window length (default 72; 240 for the synthetic demo)")
     p.add_argument("--depth", type=float, default=None,
                    help="Depth (m, positive down) for fields with vertical levels")
+    p.add_argument("--depths", type=float, nargs="+", default=None, metavar="DEPTH_M",
+                   help="Several depths, e.g. --depths 0 20 50 100: every output is made per depth "
+                        "(suffix _z<depth>m) plus side-by-side comparison figures")
     p.add_argument("--n-panels", type=int, default=6, help="Streamline snapshots across the window")
     p.add_argument("--n-points", type=int, default=100, help="Streamline grid points on the longer side")
     p.add_argument("--density", type=float, default=1.6, help="Streamline density")
@@ -355,6 +512,13 @@ def main():
     p.add_argument("--direction", choices=["forward", "backward"], default="forward",
                    help="Direction of the particle tracks (backward ends at the window's end)")
     p.add_argument("--dt-seconds", type=float, default=1800.0)
+    p.add_argument("--bg-points", type=int, default=None,
+                   help="Mean-track plots: grid points (longer side) for the grey time-mean-speed "
+                        "background (default 90, or 80 in the by-depth figure)")
+    p.add_argument("--bg-times", type=int, default=None,
+                   help="Mean-track plots: how many moments are averaged for that background "
+                        "(default 6, or 5 in the by-depth figure)")
+    p.add_argument("--dpi", type=int, default=140, help="Resolution of the saved PNG figures")
     p.add_argument("--n-traj-x", type=int, default=6)
     p.add_argument("--n-traj-y", type=int, default=None)
     p.add_argument("--cluster-size", type=int, default=3,
@@ -362,12 +526,20 @@ def main():
     p.add_argument("--cluster-spacing-km", type=float, default=None)
     p.add_argument("--out-prefix", default="flow")
     args = p.parse_args()
+    global DPI
+    DPI = args.dpi
+    bg_kw = {k: v for k, v in (("n_points", args.bg_points), ("n_bg_times", args.bg_times))
+             if v is not None}
+
+    depth_list = lt.resolve_depths(args.depth, args.depths)
+    multi = len(depth_list) > 1
+    if multi:
+        print("Depths: " + ", ".join(_label(d) for d in depth_list))
 
     if args.synthetic or not args.source:
         if not args.synthetic:
             print("No --source given; using the synthetic double gyre.", file=sys.stderr)
-        lon, lat, tri, times, u, v = ly.synthetic_double_gyre()
-        field = lt.UnstructuredVelocityField(lon, lat, tri, times, u, v)
+        field, lon, lat = ly.synthetic_demo_field(depth_list)
         if args.bbox is None:
             m = 0.003
             args.bbox = (lon.min() + m, lon.max() - m, lat.min() + m, lat.max() - m)
@@ -379,28 +551,38 @@ def main():
         t_start = np.datetime64(args.time)
         hours = args.duration_hours or 72.0
         t_end = t_start + np.timedelta64(int(hours * 3600), "s")
-        args.depth = args.depth                      # (ly._load_field reads args.depth)
         field = ly._load_field(args, t_start, t_end, tuple(args.bbox))
+    lt.warn_if_no_vertical(field, depth_list)
     bbox = tuple(args.bbox)
     span = np.timedelta64(int(hours * 3600), "s")
     t_end = t_start + span
-
-    moments = [t_start + span * f for f in np.linspace(0, 1, args.n_panels)]
-    plot_streamlines_in_time(field, bbox, moments, f"{args.out_prefix}_streamlines.png",
-                             n_points=args.n_points, depth=args.depth, density=args.density)
-    if args.animate:
-        frames = [t_start + span * f for f in np.linspace(0, 1, args.n_frames)]
-        animate_streamlines(field, bbox, frames, f"{args.out_prefix}_streamlines.gif",
-                            depth=args.depth, fps=args.fps)
-
     t_ref = t_start if args.direction == "forward" else t_end
-    tracks = compute_mean_tracks(field, bbox, t_ref, hours, args.direction, args.n_traj_x,
-                                 args.n_traj_y, args.cluster_size, args.cluster_spacing_km,
-                                 args.dt_seconds, args.depth)
-    np.savez_compressed(f"{args.out_prefix}_mean_tracks.npz",
-                        **{k: tracks[k] for k in ("mean_lon", "mean_lat", "spread_km", "elapsed_h",
-                                                  "start_lon", "start_lat", "end_lon", "end_lat")})
-    plot_mean_tracks(tracks, field, bbox, f"{args.out_prefix}_mean_tracks.png")
+
+    moments = [t_start + span * f_ for f_ in np.linspace(0, 1, args.n_panels)]
+    tracks_by_depth = []
+    for d in depth_list:
+        prefix = f"{args.out_prefix}{lt.depth_tag(d) if multi else ''}"
+        plot_streamlines_in_time(field, bbox, moments, f"{prefix}_streamlines.png",
+                                 n_points=args.n_points, depth=d, density=args.density)
+        if args.animate:
+            frames = [t_start + span * f_ for f_ in np.linspace(0, 1, args.n_frames)]
+            animate_streamlines(field, bbox, frames, f"{prefix}_streamlines.gif",
+                                depth=d, fps=args.fps)
+        tracks = compute_mean_tracks(field, bbox, t_ref, hours, args.direction, args.n_traj_x,
+                                     args.n_traj_y, args.cluster_size, args.cluster_spacing_km,
+                                     args.dt_seconds, d)
+        np.savez_compressed(f"{prefix}_mean_tracks.npz",
+                            **{k: tracks[k] for k in ("mean_lon", "mean_lat", "spread_km", "elapsed_h",
+                                                      "start_lon", "start_lat", "end_lon", "end_lat")})
+        plot_mean_tracks(tracks, field, bbox, f"{prefix}_mean_tracks.png", **bg_kw)
+        tracks_by_depth.append((d, tracks))
+
+    if multi:
+        mid = t_start + span // 2
+        plot_streamlines_by_depth(field, bbox, mid, depth_list, f"{args.out_prefix}_depths_streamlines.png",
+                                  n_points=args.n_points, density=args.density)
+        plot_mean_tracks_by_depth(tracks_by_depth, field, bbox,
+                                  f"{args.out_prefix}_depths_mean_tracks.png", **bg_kw)
 
 
 if __name__ == "__main__":
